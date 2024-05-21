@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <dirent.h>
+#include <time.h>
 #include <errno.h>
 #include <fcft/fcft.h>
 #include <fcntl.h>
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -20,6 +22,7 @@
 #include <wayland-client.h>
 #include <wayland-cursor.h>
 #include <wayland-util.h>
+#include <mpd/client.h>
 
 #include "utf8.h"
 #include "xdg-shell-protocol.h"
@@ -29,7 +32,6 @@
 
 #define DIE(fmt, ...)						\
 	do {							\
-		cleanup();					\
 		fprintf(stderr, fmt "\n", ##__VA_ARGS__);	\
 		exit(1);					\
 	} while (0)
@@ -66,79 +68,29 @@
 
 #define PROGRAM "dwlb"
 #define VERSION "0.2"
-#define USAGE								\
-	"usage: dwlb [OPTIONS]\n"					\
-	"Ipc\n"								\
-	"	-ipc				allow commands to be sent to dwl (dwl must be patched)\n" \
-	"	-no-ipc				disable ipc\n"		\
-	"Bar Config\n"							\
-	"	-hidden				bars will initially be hidden\n" \
-	"	-no-hidden			bars will not initially be hidden\n" \
-	"	-bottom				bars will initially be drawn at the bottom\n" \
-	"	-no-bottom			bars will initially be drawn at the top\n" \
-	"	-hide-vacant-tags		do not display empty and inactive tags\n" \
-	"	-no-hide-vacant-tags		display empty and inactive tags\n" \
-	"	-status-commands		enable in-line commands in status text\n" \
-	"	-no-status-commands		disable in-line commands in status text\n" \
-	"	-center-title			center title text on bar\n" \
-	"	-no-center-title		do not center title text on bar\n" \
-	"	-custom-title			do not display window title and treat the area as another status text element; see -title command\n" \
-	"	-no-custom-title		display current window title as normal\n" \
-	"	-active-color-title		title colors will use active colors\n" \
-	"	-no-active-color-title		title colors will use inactive colors\n" \
-	"	-font [FONT]			specify a font\n"	\
-	"	-tags [NUMBER] [FIRST]...[LAST]	if ipc is disabled, specify custom tag names. If NUMBER is 0, then no tag names should be given \n" \
-	"	-vertical-padding [PIXELS]	specify vertical pixel padding above and below text\n" \
-	"	-active-fg-color [COLOR]	specify text color of active tags or monitors\n" \
-	"	-active-bg-color [COLOR]	specify background color of active tags or monitors\n" \
-	"	-occupied-fg-color [COLOR]	specify text color of occupied tags\n" \
-	"	-occupied-bg-color [COLOR]	specify background color of occupied tags\n" \
-	"	-inactive-fg-color [COLOR]	specify text color of inactive tags or monitors\n" \
-	"	-inactive-bg-color [COLOR]	specify background color of inactive tags or monitors\n" \
-	"	-urgent-fg-color [COLOR]	specify text color of urgent tags\n" \
-	"	-urgent-bg-color [COLOR]	specify background color of urgent tags\n" \
-	"	-middle-bg-color [COLOR]	specify background color of the color in the middle of the bar\n" \
-	"	-middle-bg-color-selected [COLOR]	specify background color of the color in the middle of the bar, when selected\n" \
-	"	-scale [BUFFER_SCALE]		specify buffer scale value for integer scaling\n" \
-	"Commands\n"							\
-	"	-target-socket [SOCKET-NAME]	set the socket to send command to. Sockets can be found in `$XDG_RUNTIME_DIR/dwlb/`\n"\
-	"	-status	[OUTPUT] [TEXT]		set status text\n"	\
-	"	-status-stdin	[OUTPUT]		set status text from stdin\n"	\
-	"	-title	[OUTPUT] [TEXT]		set title text, if -custom-title is enabled\n"	\
-	"	-show [OUTPUT]			show bar\n"		\
-	"	-hide [OUTPUT]			hide bar\n"		\
-	"	-toggle-visibility [OUTPUT]	toggle bar visibility\n" \
-	"	-set-top [OUTPUT]		draw bar at the top\n"	\
-	"	-set-bottom [OUTPUT]		draw bar at the bottom\n" \
-	"	-toggle-location [OUTPUT]	toggle bar location\n"	\
-	"Other\n"							\
-	"	-v				get version information\n" \
-	"	-h				view this help text\n"
+#define USAGE	"us"
 
 #define TEXT_MAX 2048
 
 enum { WheelUp, WheelDown };
 
-typedef struct {
-	pixman_color_t color;
-	bool bg;
-	char *start;
-} Color;
-
-typedef struct {
-	uint32_t btn;
-	uint32_t x1;
-	uint32_t x2;
-	char command[128];
-} Button;
-
-typedef struct {
+typedef struct Block Block;
+struct Block{
+	uint32_t xl;
+	uint32_t xr;
+	pixman_color_t fg;
+	pixman_color_t bg;
+	pixman_color_t acc;
 	char text[TEXT_MAX];
-	Color *colors;
-	uint32_t colors_l, colors_c;
-	Button *buttons;
-	uint32_t buttons_l, buttons_c;
-} CustomText;
+	pixman_color_t selfg;
+	pixman_color_t selbg;
+	float xperc;
+	float yperc;
+	enum{LEFT, CENTER, RIGHT} gravity;
+	void (*clickfn)(Block*);
+	uint32_t clickid;
+	int (*updatefn)(Block*);
+};
 
 typedef struct {
 	struct wl_output *wl_output;
@@ -154,11 +106,10 @@ typedef struct {
 	uint32_t width, height;
 	uint32_t textpadding;
 	uint32_t stride, bufsize;
-	
+
 	uint32_t mtags, ctags, urg, sel;
 	char *layout, *window_title;
 	uint32_t layout_idx, last_layout_idx;
-	CustomText title, status;
 
 	bool hidden, bottom;
 	bool redraw;
@@ -177,14 +128,6 @@ typedef struct {
 
 	struct wl_list link;
 } Seat;
-
-static int sock_fd;
-static char socketdir[256];
-static char *socketpath;
-static char sockbuf[4096];
-
-static char *stdinbuf;
-static size_t stdinbuf_cap;
 
 static struct wl_display *display;
 static struct wl_compositor *compositor;
@@ -207,9 +150,24 @@ static struct fcft_font *font;
 static uint32_t height, textpadding, buffer_scale;
 
 static bool run_display;
+struct mpd_connection *conn;
 
+int songinfo(Block*);
+int bartime(Block*);
+int battery(Block*);
 #include "config.h"
 
+static void
+shell_command(char *command)
+{
+	if (fork() == 0) {
+		setsid();
+		execl("/bin/sh", "sh", "-c", command, NULL);
+		exit(EXIT_SUCCESS);
+	}
+}
+
+/* OK; BUFFER:{{{*/
 static void
 wl_buffer_release(void *data, struct wl_buffer *wl_buffer)
 {
@@ -220,7 +178,9 @@ wl_buffer_release(void *data, struct wl_buffer *wl_buffer)
 static const struct wl_buffer_listener wl_buffer_listener = {
 	.release = wl_buffer_release,
 };
+/*}}}*/
 
+/* DRAW ROUTINES:{{{*/
 /* Shared memory support function adapted from [wayland-book] */
 static int
 allocate_shm_file(size_t size)
@@ -239,6 +199,79 @@ allocate_shm_file(size_t size)
 	return fd;
 }
 
+#define TEXTW(text, padding)				\
+	zdraw_text(text, 0, 0, NULL, NULL, UINT32_MAX, 0, padding)
+
+// draw text, return end of drawn text.
+static uint32_t
+zdraw_text(char *text,
+	  uint32_t x,
+	  uint32_t y,
+	  pixman_image_t *img,
+	  pixman_color_t *color,
+	  uint32_t max_x,
+	  uint32_t buf_height,
+	  uint32_t padding)
+{
+	if (!text || !*text || !max_x)
+		return x;
+	bool draw_img = img && color;
+	pixman_image_t *fill;
+	if (draw_img)
+		fill = pixman_image_create_solid_fill(color);
+
+	uint32_t ix = x, nx;
+	x += padding;
+	uint32_t codepoint, state = UTF8_ACCEPT, last_cp = 0;
+	for (char *p = text; *p; p++) {
+		/* Returns nonzero if more bytes are needed */
+		if (utf8decode(&state, &codepoint, *p)) continue;
+
+		/* Turn off subpixel rendering, which complicates things when
+		 * mixed with alpha channels */
+		const struct fcft_glyph *glyph = fcft_rasterize_char_utf32(font, codepoint, FCFT_SUBPIXEL_NONE);
+		if (!glyph) continue;
+
+		/* Adjust x position based on kerning with previous glyph */
+		long kern = 0;
+		if (last_cp)
+			fcft_kerning(font, last_cp, codepoint, &kern, NULL);
+		if ((nx = x + kern + glyph->advance.x) + padding > max_x)
+			break;
+		last_cp = codepoint;
+		x += kern;
+
+		if (draw_img) {
+			/* Detect and handle pre-rendered glyphs (e.g. emoji) */
+			if (pixman_image_get_format(glyph->pix) == PIXMAN_a8r8g8b8) {
+				/* Only the alpha channel of the mask is used, so we can
+				 * use fgfill here to blend prerendered glyphs with the
+				 * same opacity */
+				pixman_image_composite32(
+					PIXMAN_OP_OVER, glyph->pix, fill, img, 0, 0, 0, 0,
+					x + glyph->x, y - glyph->y, glyph->width, glyph->height);
+			} else {
+				/* Applying the foreground color here would mess up
+				 * component alphas for subpixel-rendered text, so we
+				 * apply it when blending. */
+				pixman_image_composite32(
+					PIXMAN_OP_OVER, fill, glyph->pix, img, 0, 0, 0, 0,
+					x + glyph->x, y - glyph->y, glyph->width, glyph->height);
+			}
+		}
+		/* increment pen position */
+		x = nx;
+	}
+	if (draw_img)
+		pixman_image_unref(fill);
+	if (!last_cp)
+		return ix;
+
+	nx = x + padding;
+	return nx;
+}
+
+// old color{{{
 static uint32_t
 draw_text(char *text,
 	  uint32_t x,
@@ -249,9 +282,7 @@ draw_text(char *text,
 	  pixman_color_t *bg_color,
 	  uint32_t max_x,
 	  uint32_t buf_height,
-	  uint32_t padding,
-	  Color *colors,
-	  uint32_t colors_l)
+	  uint32_t padding)
 {
 	if (!text || !*text || !max_x)
 		return x;
@@ -264,30 +295,13 @@ draw_text(char *text,
 
 	bool draw_fg = foreground && fg_color;
 	bool draw_bg = background && bg_color;
-	
+
 	pixman_image_t *fg_fill;
-	pixman_color_t *cur_bg_color;
 	if (draw_fg)
 		fg_fill = pixman_image_create_solid_fill(fg_color);
-	if (draw_bg)
-		cur_bg_color = bg_color;
 
-	uint32_t color_ind = 0, codepoint, state = UTF8_ACCEPT, last_cp = 0;
+	uint32_t codepoint, state = UTF8_ACCEPT, last_cp = 0;
 	for (char *p = text; *p; p++) {
-		/* Check for new colors */
-		if (state == UTF8_ACCEPT && colors && (draw_fg || draw_bg)) {
-			while (color_ind < colors_l && p == colors[color_ind].start) {
-				if (colors[color_ind].bg) {
-					if (draw_bg)
-						cur_bg_color = &colors[color_ind].color;
-				} else if (draw_fg) {
-					pixman_image_unref(fg_fill);
-					fg_fill = pixman_image_create_solid_fill(&colors[color_ind].color);
-				}
-				color_ind++;
-			}
-		}
-		
 		/* Returns nonzero if more bytes are needed */
 		if (utf8decode(&state, &codepoint, *p))
 			continue;
@@ -325,44 +339,93 @@ draw_text(char *text,
 					x + glyph->x, y - glyph->y, glyph->width, glyph->height);
 			}
 		}
-		
-		if (draw_bg) {
-			pixman_image_fill_boxes(PIXMAN_OP_OVER, background,
-						cur_bg_color, 1, &(pixman_box32_t){
-							.x1 = x, .x2 = nx,
-							.y1 = 0, .y2 = buf_height
-						});
-		}
-		
 		/* increment pen position */
 		x = nx;
 	}
-	
+
 	if (draw_fg)
 		pixman_image_unref(fg_fill);
 	if (!last_cp)
 		return ix;
-	
+
 	nx = x + padding;
 	if (draw_bg) {
 		/* Fill padding background */
 		pixman_image_fill_boxes(PIXMAN_OP_OVER, background,
 					bg_color, 1, &(pixman_box32_t){
-						.x1 = ix, .x2 = ix + padding,
-						.y1 = 0, .y2 = buf_height
-					});
-		pixman_image_fill_boxes(PIXMAN_OP_OVER, background,
-					bg_color, 1, &(pixman_box32_t){
-						.x1 = x, .x2 = nx,
+						.x1 = ix, .x2 = nx,
 						.y1 = 0, .y2 = buf_height
 					});
 	}
-	
+
 	return nx;
 }
+//}}}
+
+int bartime(Block* st){
+	static time_t t=0;
+	time_t tt = time(0);
+	if(tt == t) return 0;
+	t = tt;
+	static struct tm now;
+	localtime_r(&t, &now);
+	st->xperc = (float)now.tm_sec/60.0f;
+	st->yperc = 1;
+	sprintf(st->text, "%02d:%02d", now.tm_hour, now.tm_min);
+	return 1;
+}
+
+int songinfo(Block* st){
+	struct mpd_status* stat = mpd_run_status(conn);
+	/* get song name (and length) */
+	struct mpd_song* now_playing = mpd_run_current_song(conn);
+	if(now_playing == 0 || stat==0){
+		strcpy(st->text, "no song playing");
+		st->xperc = 1;
+		st->yperc = 1;
+		return 0;
+	}
+	const char* name = mpd_song_get_tag(now_playing, MPD_TAG_TITLE, 0);
+	const char* artist = mpd_song_get_tag(now_playing, MPD_TAG_ALBUM_ARTIST, 0);
+	if(artist == NULL)
+		artist = mpd_song_get_tag(now_playing, MPD_TAG_ARTIST, 0);
+
+	unsigned a = mpd_song_get_duration(now_playing);
+	unsigned b = mpd_status_get_elapsed_time(stat);
+	sprintf(st->text, "%s - %s", artist, name);
+	st->xperc = (float)b/(float)a;
+	st->yperc = (float)mpd_status_get_volume(stat)/100.0f;
+
+	mpd_song_free(now_playing);
+	mpd_status_free(stat);
+	return 0;
+}
+
+int battery(Block* st){
+	FILE* f;
+	f = fopen("/sys/class/power_supply/BAT1/power_now","r");
+	int pow = 0;
+	fscanf(f, "%d", &pow);
+	fclose(f);
+	sprintf(st->text, "%.2fW", (float)pow/1000000.0f);
+
+	float full = 0;
+	float now = 0;
+	f = fopen("/sys/class/power_supply/BAT1/energy_full","r");
+	fscanf(f, "%f", &full);
+	fclose(f);
+	f = fopen("/sys/class/power_supply/BAT1/energy_now","r");
+	fscanf(f, "%f", &now);
+	fclose(f);
+
+	st->xperc = 1.0f;
+	st->yperc = now/full;
+	return 0;
+}
+
 
 #define TEXT_WIDTH(text, maxwidth, padding)				\
-	draw_text(text, 0, 0, NULL, NULL, NULL, NULL, maxwidth, 0, padding, NULL, 0)
+	draw_text(text, 0, 0, NULL, NULL, NULL, NULL, maxwidth, 0, padding)
 
 static int
 draw_frame(Bar *bar)
@@ -386,11 +449,11 @@ draw_frame(Bar *bar)
 
 	/* Pixman image corresponding to main buffer */
 	pixman_image_t *final = pixman_image_create_bits(PIXMAN_a8r8g8b8, bar->width, bar->height, data, bar->width * 4);
-	
+
 	/* Text background and foreground layers */
 	pixman_image_t *foreground = pixman_image_create_bits(PIXMAN_a8r8g8b8, bar->width, bar->height, NULL, bar->width * 4);
 	pixman_image_t *background = pixman_image_create_bits(PIXMAN_a8r8g8b8, bar->width, bar->height, NULL, bar->width * 4);
-	
+
 	/* Draw on images */
 	uint32_t x = 0;
 	uint32_t y = (bar->height + font->ascent - font->descent) / 2;
@@ -401,13 +464,13 @@ draw_frame(Bar *bar)
 		const bool active = bar->mtags & 1 << i;
 		const bool occupied = bar->ctags & 1 << i;
 		const bool urgent = bar->urg & 1 << i;
-		
+
 		if (hide_vacant && !active && !occupied && !urgent)
 			continue;
 
 		pixman_color_t *fg_color = urgent ? &urgent_fg_color : (active ? &active_fg_color : (occupied ? &occupied_fg_color : &inactive_fg_color));
 		pixman_color_t *bg_color = urgent ? &urgent_bg_color : (active ? &active_bg_color : (occupied ? &occupied_bg_color : &inactive_bg_color));
-		
+
 		if (!hide_vacant && occupied) {
 			pixman_image_fill_boxes(PIXMAN_OP_SRC, foreground,
 						fg_color, 1, &(pixman_box32_t){
@@ -424,51 +487,47 @@ draw_frame(Bar *bar)
 							});
 			}
 		}
-		
+
 		x = draw_text(tags[i], x, y, foreground, background, fg_color, bg_color,
-			      bar->width, bar->height, bar->textpadding, NULL, 0);
+			      bar->width, bar->height, bar->textpadding);
 	}
-	
+
 	x = draw_text(bar->layout, x, y, foreground, background,
 		      &inactive_fg_color, &inactive_bg_color, bar->width,
-		      bar->height, bar->textpadding, NULL, 0);
-	
-	uint32_t status_width = TEXT_WIDTH(bar->status.text, bar->width - x, bar->textpadding);
-	draw_text(bar->status.text, bar->width - status_width, y, foreground,
-		  background, &inactive_fg_color, &inactive_bg_color,
-		  bar->width, bar->height, bar->textpadding,
-		  bar->status.colors, bar->status.colors_l);
-
+		      bar->height, bar->textpadding);
+	// from x free space
 	uint32_t nx;
-	if (center_title) {
-		uint32_t title_width = TEXT_WIDTH(custom_title ? bar->title.text : bar->window_title, bar->width - status_width - x, 0);
-		nx = MAX(x, MIN((bar->width - title_width) / 2, bar->width - status_width - title_width));
-	} else {
-		nx = MIN(x + bar->textpadding, bar->width - status_width);
+	uint32_t lx = x;
+	uint32_t cx = bar->width/2;
+	uint32_t rx = bar->width;
+	for(int i=0; i<nblocks; i++){
+		switch(blocks[i].gravity){
+			case RIGHT:
+				x = rx = (rx - TEXT_WIDTH(blocks[i].text,bar->width, bar->textpadding));
+				break;
+			case LEFT:
+				x = lx;
+				break;
+			case CENTER:
+				x =(cx - TEXT_WIDTH(blocks[i].text,bar->width, bar->textpadding)/2);
+				break;
+		}
+		nx = zdraw_text(blocks[i].text, x, y, foreground, &blocks[i].fg, bar->width, bar->height, bar->textpadding);
+		pixman_image_fill_boxes(PIXMAN_OP_SRC, background,
+					&blocks[i].bg,
+					1, &(pixman_box32_t){
+						.x1 = x, .x2 = nx,
+						.y1 = 0, .y2 = bar->height
+					});
+		pixman_image_fill_boxes(PIXMAN_OP_SRC, background,
+					&blocks[i].acc,
+					1, &(pixman_box32_t){
+						.x1 = x, .x2 = x + (nx - x)*blocks[i].xperc,
+						.y1 = bar->height * (1 - blocks[i].yperc), .y2 = bar->height
+					});
+		blocks[i].xl = x;
+		blocks[i].xr = nx;
 	}
-	pixman_image_fill_boxes(PIXMAN_OP_SRC, background,
-				bar->sel ? &middle_bg_color_selected : &middle_bg_color, 1,
-				&(pixman_box32_t){
-					.x1 = x, .x2 = nx,
-					.y1 = 0, .y2 = bar->height
-				});
-	x = nx;
-	
-	x = draw_text(custom_title ? bar->title.text : bar->window_title,
-		      x, y, foreground, background,
-		      (bar->sel && active_color_title) ? &active_fg_color : &inactive_fg_color,
-		      (bar->sel && active_color_title) ? &active_bg_color : &inactive_bg_color,
-		      bar->width - status_width, bar->height, 0,
-		      custom_title ? bar->title.colors : NULL,
-		      custom_title ? bar->title.colors_l : 0);
-
-	pixman_image_fill_boxes(PIXMAN_OP_SRC, background,
-				bar->sel ? &middle_bg_color_selected : &middle_bg_color, 1,
-				&(pixman_box32_t){
-					.x1 = x, .x2 = bar->width - status_width,
-					.y1 = 0, .y2 = bar->height
-				});
-
 	/* Draw background and foreground on bar */
 	pixman_image_composite32(PIXMAN_OP_OVER, background, NULL, final, 0, 0, 0, 0, 0, 0, bar->width, bar->height);
 	pixman_image_composite32(PIXMAN_OP_OVER, foreground, NULL, final, 0, 0, 0, 0, 0, 0, bar->width, bar->height);
@@ -476,7 +535,7 @@ draw_frame(Bar *bar)
 	pixman_image_unref(foreground);
 	pixman_image_unref(background);
 	pixman_image_unref(final);
-	
+
 	munmap(data, bar->bufsize);
 
 	wl_surface_set_buffer_scale(bar->wl_surface, buffer_scale);
@@ -487,6 +546,10 @@ draw_frame(Bar *bar)
 	return 0;
 }
 
+/*}}}*/
+
+/* OK; LAYER SURFACE:{{{*/
+
 /* Layer-surface setup adapted from layer-shell example in [wlroots] */
 static void
 layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *surface,
@@ -496,12 +559,12 @@ layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *surface,
 	h = h * buffer_scale;
 
 	zwlr_layer_surface_v1_ack_configure(surface, serial);
-	
+
 	Bar *bar = (Bar *)data;
-	
+
 	if (bar->configured && w == bar->width && h == bar->height)
 		return;
-	
+
 	bar->width = w;
 	bar->height = h;
 	bar->stride = bar->width * 4;
@@ -520,19 +583,14 @@ static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 	.configure = layer_surface_configure,
 	.closed = layer_surface_closed,
 };
+/*}}}*/
 
-static void
-cleanup(void)
-{
-	if (socketpath)
-		unlink(socketpath);
-}
-
+/* OK; XDG_OUTPUT:{{{ */
 static void
 output_name(void *data, struct zxdg_output_v1 *xdg_output, const char *name)
 {
 	Bar *bar = (Bar *)data;
-	
+
 	if (bar->xdg_output_name)
 		free(bar->xdg_output_name);
 	if (!(bar->xdg_output_name = strdup(name)))
@@ -569,17 +627,9 @@ static const struct zxdg_output_v1_listener output_listener = {
 	.done = output_done,
 	.description = output_description
 };
+/*}}}*/
 
-static void
-shell_command(char *command)
-{
-	if (fork() == 0) {
-		setsid();
-		execl("/bin/sh", "sh", "-c", command, NULL);
-		exit(EXIT_SUCCESS);
-	}
-}
-
+/* POINTER_EVENTS: {{{*/
 static void
 pointer_enter(void *data, struct wl_pointer *pointer,
 	      uint32_t serial, struct wl_surface *surface,
@@ -587,6 +637,7 @@ pointer_enter(void *data, struct wl_pointer *pointer,
 {
 	Seat *seat = (Seat *)data;
 
+	// get correct bar
 	seat->bar = NULL;
 	Bar *bar;
 	wl_list_for_each(bar, &bar_list, link) {
@@ -618,7 +669,7 @@ pointer_leave(void *data, struct wl_pointer *pointer,
 	      uint32_t serial, struct wl_surface *surface)
 {
 	Seat *seat = (Seat *)data;
-	
+
 	seat->bar = NULL;
 }
 
@@ -636,7 +687,7 @@ pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
 	       wl_fixed_t surface_x, wl_fixed_t surface_y)
 {
 	Seat *seat = (Seat *)data;
-	
+
 	seat->pointer_x = wl_fixed_to_int(surface_x);
 	seat->pointer_y = wl_fixed_to_int(surface_y);
 }
@@ -663,56 +714,19 @@ pointer_frame(void *data, struct wl_pointer *pointer)
 
 	if (i < tags_l) {
 		/* Clicked on tags */
-		if (ipc) {
-			if (seat->pointer_button == BTN_LEFT)
-				zdwl_ipc_output_v2_set_tags(seat->bar->dwl_wm_output, 1 << i, 1);
-			else if (seat->pointer_button == BTN_MIDDLE)
-				zdwl_ipc_output_v2_set_tags(seat->bar->dwl_wm_output, ~0, 1);
-			else if (seat->pointer_button == BTN_RIGHT)
-				zdwl_ipc_output_v2_set_tags(seat->bar->dwl_wm_output, seat->bar->mtags ^ (1 << i), 0);
-		}
+		if (seat->pointer_button == BTN_LEFT)
+			zdwl_ipc_output_v2_set_tags(seat->bar->dwl_wm_output, 1 << i, 1);
+		else if (seat->pointer_button == BTN_MIDDLE)
+			zdwl_ipc_output_v2_set_tags(seat->bar->dwl_wm_output, ~0, 1);
+		else if (seat->pointer_button == BTN_RIGHT)
+			zdwl_ipc_output_v2_set_tags(seat->bar->dwl_wm_output, seat->bar->mtags ^ (1 << i), 0);
 	} else if (seat->pointer_x < (x += TEXT_WIDTH(seat->bar->layout, seat->bar->width - x, seat->bar->textpadding))) {
 		/* Clicked on layout */
-		if (ipc) {
-			if (seat->pointer_button == BTN_LEFT)
-				zdwl_ipc_output_v2_set_layout(seat->bar->dwl_wm_output, seat->bar->last_layout_idx);
-			else if (seat->pointer_button == BTN_RIGHT)
-				zdwl_ipc_output_v2_set_layout(seat->bar->dwl_wm_output, 2);
-		}
-	} else {
-		uint32_t status_x = seat->bar->width / buffer_scale - TEXT_WIDTH(seat->bar->status.text, seat->bar->width - x, seat->bar->textpadding) / buffer_scale;
-		if (seat->pointer_x < status_x) {
-			/* Clicked on title */
-			if (custom_title) {
-				if (center_title) {
-					uint32_t title_width = TEXT_WIDTH(seat->bar->title.text, status_x - x, 0);
-					x = MAX(x, MIN((seat->bar->width - title_width) / 2, status_x - title_width));
-				} else {
-					x = MIN(x + seat->bar->textpadding, status_x);
-				}
-				for (i = 0; i < seat->bar->title.buttons_l; i++) {
-					if (seat->pointer_button == seat->bar->title.buttons[i].btn
-					    && seat->pointer_x >= x + seat->bar->title.buttons[i].x1
-					    && seat->pointer_x < x + seat->bar->title.buttons[i].x2) {
-						shell_command(seat->bar->title.buttons[i].command);
-						break;
-					}
-				}
-			}
-		} else {
-			/* Clicked on status */
-			for (i = 0; i < seat->bar->status.buttons_l; i++) {
-			
-				if (seat->pointer_button == seat->bar->status.buttons[i].btn
-				    && seat->pointer_x >= status_x + seat->bar->textpadding + seat->bar->status.buttons[i].x1 / buffer_scale
-				    && seat->pointer_x < status_x + seat->bar->textpadding + seat->bar->status.buttons[i].x2 / buffer_scale) {
-					shell_command(seat->bar->status.buttons[i].command);
-					break;
-				}
-			}
-		}
+		if (seat->pointer_button == BTN_LEFT)
+			zdwl_ipc_output_v2_set_layout(seat->bar->dwl_wm_output, seat->bar->last_layout_idx);
+		else if (seat->pointer_button == BTN_RIGHT)
+			zdwl_ipc_output_v2_set_layout(seat->bar->dwl_wm_output, 2);
 	}
-	
 	seat->pointer_button = 0;
 }
 
@@ -732,19 +746,6 @@ pointer_axis_discrete(void *data, struct wl_pointer *pointer,
 
 	if (!seat->bar)
 		return;
-
-	uint32_t status_x = seat->bar->width / buffer_scale - TEXT_WIDTH(seat->bar->status.text, seat->bar->width, seat->bar->textpadding) / buffer_scale;
-	if (seat->pointer_x > status_x) {
-		/* Clicked on status */
-		for (i = 0; i < seat->bar->status.buttons_l; i++) {
-			if (btn == seat->bar->status.buttons[i].btn
-			    && seat->pointer_x >= status_x + seat->bar->textpadding + seat->bar->status.buttons[i].x1 / buffer_scale
-			    && seat->pointer_x < status_x + seat->bar->textpadding + seat->bar->status.buttons[i].x2 / buffer_scale) {
-				shell_command(seat->bar->status.buttons[i].command);
-				break;
-			}
-		}
-	}
 }
 
 static void
@@ -777,13 +778,15 @@ static const struct wl_pointer_listener pointer_listener = {
 	.leave = pointer_leave,
 	.motion = pointer_motion,
 };
+/*}}}*/
 
+/* OK; SEAT:{{{*/
 static void
 seat_capabilities(void *data, struct wl_seat *wl_seat,
 		  uint32_t capabilities)
 {
 	Seat *seat = (Seat *)data;
-	
+
 	uint32_t has_pointer = capabilities & WL_SEAT_CAPABILITY_POINTER;
 	if (has_pointer && !seat->wl_pointer) {
 		seat->wl_pointer = wl_seat_get_pointer(seat->wl_seat);
@@ -803,7 +806,9 @@ static const struct wl_seat_listener seat_listener = {
 	.capabilities = seat_capabilities,
 	.name = seat_name,
 };
+/*}}}*/
 
+/* MOSTLY OK; add num clients. DWL COMMUNICATION:{{{*/
 static void
 show_bar(Bar *bar)
 {
@@ -921,9 +926,6 @@ static void
 dwl_wm_output_title(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output,
 	const char *title)
 {
-	if (custom_title)
-		return;
-
 	Bar *bar = (Bar *)data;
 
 	if (bar->window_title)
@@ -982,7 +984,9 @@ static const struct zdwl_ipc_output_v2_listener dwl_wm_output_listener = {
 	.fullscreen = dwl_wm_output_fullscreen,
 	.floating = dwl_wm_output_floating
 };
+/*}}}*/
 
+/* OK; after removal of customtext fix. SETUP + WL_REGISTRY:{{{*/
 static void
 setup_bar(Bar *bar)
 {
@@ -996,13 +1000,11 @@ setup_bar(Bar *bar)
 		DIE("Could not create xdg_output");
 	zxdg_output_v1_add_listener(bar->xdg_output, &output_listener, bar);
 
-	if (ipc) {
-		bar->dwl_wm_output = zdwl_ipc_manager_v2_get_output(dwl_wm, bar->wl_output);
-		if (!bar->dwl_wm_output)
-			DIE("Could not create dwl_wm_output");
-		zdwl_ipc_output_v2_add_listener(bar->dwl_wm_output, &dwl_wm_output_listener, bar);
-	}
-	
+	bar->dwl_wm_output = zdwl_ipc_manager_v2_get_output(dwl_wm, bar->wl_output);
+	if (!bar->dwl_wm_output)
+		DIE("Could not create dwl_wm_output");
+	zdwl_ipc_output_v2_add_listener(bar->dwl_wm_output, &dwl_wm_output_listener, bar);
+
 	if (!bar->hidden)
 		show_bar(bar);
 }
@@ -1020,10 +1022,8 @@ handle_global(void *data, struct wl_registry *registry,
 	} else if (!strcmp(interface, zxdg_output_manager_v1_interface.name)) {
 		output_manager = wl_registry_bind(registry, name, &zxdg_output_manager_v1_interface, 2);
 	} else if (!strcmp(interface, zdwl_ipc_manager_v2_interface.name)) {
-		if (ipc) {
-			dwl_wm = wl_registry_bind(registry, name, &zdwl_ipc_manager_v2_interface, 2);
-			zdwl_ipc_manager_v2_add_listener(dwl_wm, &dwl_wm_listener, NULL);
-		}
+		dwl_wm = wl_registry_bind(registry, name, &zdwl_ipc_manager_v2_interface, 2);
+		zdwl_ipc_manager_v2_add_listener(dwl_wm, &dwl_wm_listener, NULL);
 	} else if (!strcmp(interface, wl_output_interface.name)) {
 		Bar *bar = calloc(1, sizeof(Bar));
 		if (!bar)
@@ -1047,26 +1047,15 @@ handle_global(void *data, struct wl_registry *registry,
 static void
 teardown_bar(Bar *bar)
 {
-	if (bar->status.colors)
-		free(bar->status.colors);
-	if (bar->status.buttons)
-		free(bar->status.buttons);
-	if (bar->title.colors)
-		free(bar->title.colors);
-	if (bar->title.buttons)
-		free(bar->title.buttons);
 	if (bar->window_title)
 		free(bar->window_title);
-	if (!ipc && bar->layout)
-		free(bar->layout);
-	if (ipc)
-		zdwl_ipc_output_v2_destroy(bar->dwl_wm_output);
 	if (bar->xdg_output_name)
 		free(bar->xdg_output_name);
 	if (!bar->hidden) {
 		zwlr_layer_surface_v1_destroy(bar->layer_surface);
 		wl_surface_destroy(bar->wl_surface);
 	}
+	zdwl_ipc_output_v2_destroy(bar->dwl_wm_output);
 	zxdg_output_v1_destroy(bar->xdg_output);
 	wl_output_destroy(bar->wl_output);
 	free(bar);
@@ -1086,7 +1075,7 @@ handle_global_remove(void *data, struct wl_registry *registry, uint32_t name)
 {
 	Bar *bar;
 	Seat *seat;
-	
+
 	wl_list_for_each(bar, &bar_list, link) {
 		if (bar->registry_name == name) {
 			wl_list_remove(&bar->link);
@@ -1107,553 +1096,33 @@ static const struct wl_registry_listener registry_listener = {
 	.global = handle_global,
 	.global_remove = handle_global_remove
 };
-
-static int
-advance_word(char **beg, char **end)
-{
-	for (*beg = *end; **beg == ' '; (*beg)++);
-	for (*end = *beg; **end && **end != ' '; (*end)++);
-	if (!**end)
-		/* last word */
-		return -1;
-	**end = '\0';
-	(*end)++;
-	return 0;
-}
-
-#define ADVANCE() advance_word(&wordbeg, &wordend)
-#define ADVANCE_IF_LAST_CONT() if (ADVANCE() == -1) continue
-#define ADVANCE_IF_LAST_RET() if (ADVANCE() == -1) return
-
-static void
-read_stdin(void)
-{
-	size_t len = 0;
-	for (;;) {
-		ssize_t rv = read(STDIN_FILENO, stdinbuf + len, stdinbuf_cap - len);
-		if (rv == -1) {
-			if (errno == EWOULDBLOCK)
-				break;
-			EDIE("read");
-		}
-		if (rv == 0) {
-			run_display = false;
-			return;
-		}
-
-		if ((len += rv) > stdinbuf_cap / 2)
-			if (!(stdinbuf = realloc(stdinbuf, (stdinbuf_cap *= 2))))
-				EDIE("realloc");
-	}
-
-	char *linebeg, *lineend;
-	char *wordbeg, *wordend;
-	
-	for (linebeg = stdinbuf;
-	     (lineend = memchr(linebeg, '\n', stdinbuf + len - linebeg));
-	     linebeg = lineend) {
-		*lineend++ = '\0';
-		wordend = linebeg;
-
-		ADVANCE_IF_LAST_CONT();
-
-		Bar *it, *bar = NULL;
-		wl_list_for_each(it, &bar_list, link) {
-			if (it->xdg_output_name && !strcmp(wordbeg, it->xdg_output_name)) {
-				bar = it;
-				break;
-			}
-		}
-		if (!bar)
-			continue;
-		
-		ADVANCE_IF_LAST_CONT();
-
-		uint32_t val;
-		if (!strcmp(wordbeg, "tags")) {
-			ADVANCE_IF_LAST_CONT();
-			if ((val = atoi(wordbeg)) != bar->ctags) {
-				bar->ctags = val;
-				bar->redraw = true;
-			}
-			ADVANCE_IF_LAST_CONT();
-			if ((val = atoi(wordbeg)) != bar->mtags) {
-				bar->mtags = val;
-				bar->redraw = true;
-			}
-			ADVANCE_IF_LAST_CONT();
-			/* skip sel */
-			ADVANCE();
-			if ((val = atoi(wordbeg)) != bar->urg) {
-				bar->urg = val;
-				bar->redraw = true;
-			}
-		} else if (!strcmp(wordbeg, "layout")) {
-			if (bar->layout)
-				free(bar->layout);
-			if (!(bar->layout = strdup(wordend)))
-				EDIE("strdup");
-			bar->redraw = true;
-		} else if (!strcmp(wordbeg, "title")) {
-			if (custom_title)
-				continue;
-			if (bar->window_title)
-				free(bar->window_title);
-			if (!(bar->window_title = strdup(wordend)))
-				EDIE("strdup");
-			bar->redraw = true;
-		} else if (!strcmp(wordbeg, "selmon")) {
-			ADVANCE();
-			if ((val = atoi(wordbeg)) != bar->sel) {
-				bar->sel = val;
-				bar->redraw = true;
-			}
-		}
-	}
-}
-
-static void
-set_top(Bar *bar)
-{
-	if (!bar->hidden) {
-		zwlr_layer_surface_v1_set_anchor(bar->layer_surface,
-						 ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP
-						 | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT
-						 | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-		bar->redraw = true;
-	}
-	bar->bottom = false;
-}
-
-static void
-set_bottom(Bar *bar)
-{
-	if (!bar->hidden) {
-		zwlr_layer_surface_v1_set_anchor(bar->layer_surface,
-						 ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM
-						 | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT
-						 | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-		bar->redraw = true;
-	}
-	bar->bottom = true;
-}
-
-/* Color parsing logic adapted from [sway] */
-static int
-parse_color(const char *str, pixman_color_t *clr)
-{
-	if (*str == '#')
-		str++;
-	int len = strlen(str);
-
-	// Disallows "0x" prefix that strtoul would ignore
-	if ((len != 6 && len != 8) || !isxdigit(str[0]) || !isxdigit(str[1]))
-		return -1;
-
-	char *ptr;
-	uint32_t parsed = strtoul(str, &ptr, 16);
-	if (*ptr)
-		return -1;
-
-	if (len == 8) {
-		clr->alpha = (parsed & 0xff) * 0x101;
-		parsed >>= 8;
-	} else {
-		clr->alpha = 0xffff;
-	}
-	clr->red =   ((parsed >> 16) & 0xff) * 0x101;
-	clr->green = ((parsed >>  8) & 0xff) * 0x101;
-	clr->blue =  ((parsed >>  0) & 0xff) * 0x101;
-	return 0;
-}
-
-static void
-parse_into_customtext(CustomText *ct, char *text)
-{
-	ct->colors_l = ct->buttons_l = 0;
-
-	if (status_commands) {
-		uint32_t codepoint;
-		uint32_t state = UTF8_ACCEPT;
-		uint32_t last_cp = 0;
-		uint32_t x = 0;
-		size_t str_pos = 0;
-
-		Button *left_button = NULL;
-		Button *middle_button = NULL;
-		Button *right_button = NULL;
-		Button *scrollup_button = NULL;
-		Button *scrolldown_button = NULL;
-	
-		for (char *p = text; *p && str_pos < sizeof(ct->text) - 1; p++) {
-			if (state == UTF8_ACCEPT && *p == '^') {
-				p++;
-				if (*p != '^') {
-					char *arg, *end;
-					if (!(arg = strchr(p, '(')) || !(end = strchr(arg + 1, ')')))
-						continue;
-					*arg++ = '\0';
-					*end = '\0';
-				
-					if (!strcmp(p, "bg")) {
-						Color *color;
-						ARRAY_APPEND(ct->colors, ct->colors_l, ct->colors_c, color);
-						if (!*arg)
-							color->color = inactive_bg_color;
-						else
-							parse_color(arg, &color->color);
-						color->bg = true;
-						color->start = ct->text + str_pos;
-					} else if (!strcmp(p, "fg")) {
-						Color *color;
-						ARRAY_APPEND(ct->colors, ct->colors_l, ct->colors_c, color);
-						if (!*arg)
-							color->color = inactive_fg_color;
-						else
-							parse_color(arg, &color->color);
-						color->bg = false;
-						color->start = ct->text + str_pos;
-					} else if (!strcmp(p, "lm")) {
-						if (left_button) {
-							left_button->x2 = x;
-							left_button = NULL;
-						} else if (*arg) {
-							ARRAY_APPEND(ct->buttons, ct->buttons_l, ct->buttons_c, left_button);
-							left_button->btn = BTN_LEFT;
-							snprintf(left_button->command, sizeof left_button->command, "%s", arg);
-							left_button->x1 = x;
-						}
-					} else if (!strcmp(p, "mm")) {
-						if (middle_button) {
-							middle_button->x2 = x;
-							middle_button = NULL;
-						} else if (*arg) {
-							ARRAY_APPEND(ct->buttons, ct->buttons_l, ct->buttons_c, middle_button);
-							middle_button->btn = BTN_MIDDLE;
-							snprintf(middle_button->command, sizeof middle_button->command, "%s", arg);
-							middle_button->x1 = x;
-						}
-					} else if (!strcmp(p, "rm")) {
-						if (right_button) {
-							right_button->x2 = x;
-							right_button = NULL;
-						} else if (*arg) {
-							ARRAY_APPEND(ct->buttons, ct->buttons_l, ct->buttons_c, right_button);
-							right_button->btn = BTN_RIGHT;
-							snprintf(right_button->command, sizeof right_button->command, "%s", arg);
-							right_button->x1 = x;
-						}
-					} else if (!strcmp(p, "us")) {
-						if (scrollup_button) {
-							scrollup_button->x2 = x;
-							scrollup_button = NULL;
-						} else if (*arg) {
-							ARRAY_APPEND(ct->buttons, ct->buttons_l, ct->buttons_c, scrollup_button);
-							scrollup_button->btn = WheelUp;
-							snprintf(scrollup_button->command, sizeof scrollup_button->command, "%s", arg);
-							scrollup_button->x1 = x;
-						}
-					} else if (!strcmp(p, "ds")) {
-						if (scrolldown_button) {
-							scrolldown_button->x2 = x;
-							scrolldown_button = NULL;
-						} else if (*arg) {
-							ARRAY_APPEND(ct->buttons, ct->buttons_l, ct->buttons_c, scrolldown_button);
-							scrolldown_button->btn = WheelDown;
-							snprintf(scrolldown_button->command, sizeof scrolldown_button->command, "%s", arg);
-							scrolldown_button->x1 = x;
-						}
-					} 
-
-					*--arg = '(';
-					*end = ')';
-				
-					p = end;
-					continue;
-				}
-			}
-
-			ct->text[str_pos++] = *p;
-			
-			if (utf8decode(&state, &codepoint, *p))
-				continue;
-			
-			const struct fcft_glyph *glyph = fcft_rasterize_char_utf32(font, codepoint, FCFT_SUBPIXEL_NONE);
-			if (!glyph)
-				continue;
-				
-			long kern = 0;
-			if (last_cp)
-				fcft_kerning(font, last_cp, codepoint, &kern, NULL);
-			last_cp = codepoint;
-			
-			x += kern + glyph->advance.x;
-		}
-
-		if (left_button)
-			left_button->x2 = x;
-		if (middle_button)
-			middle_button->x2 = x;
-		if (right_button)
-			right_button->x2 = x;
-		if (scrollup_button)
-			scrollup_button->x2 = x;
-		if (scrolldown_button)
-			scrolldown_button->x2 = x;
-	
-		
-		ct->text[str_pos] = '\0';
-	} else {
-		snprintf(ct->text, sizeof ct->text, "%s", text);
-	}
-}
-
-static void
-copy_customtext(CustomText *from, CustomText *to)
-{
-	snprintf(to->text, sizeof to->text, "%s", from->text);
-	to->colors_l = to->buttons_l = 0;
-	for (uint32_t i = 0; i < from->colors_l; i++) {
-		Color *color;
-		ARRAY_APPEND(to->colors, to->colors_l, to->colors_c, color);
-		color->color = from->colors[i].color;
-		color->bg = from->colors[i].bg;
-		color->start = from->colors[i].start - (char *)&from->text + (char *)&to->text;
-	}
-	for (uint32_t i = 0; i < from->buttons_l; i++) {
-		Button *button;
-		ARRAY_APPEND(to->buttons, to->buttons_l, to->buttons_c, button);
-		*button = from->buttons[i];
-	}
-}
-
-static void
-read_socket(void)
-{
-	int cli_fd;
-	if ((cli_fd = accept(sock_fd, NULL, 0)) == -1)
-		EDIE("accept");
-	ssize_t len = recv(cli_fd, sockbuf, sizeof sockbuf - 1, 0);
-	if (len == -1)
-		EDIE("recv");
-	close(cli_fd);
-	if (len == 0)
-		return;
-	sockbuf[len] = '\0';
-
-	char *wordbeg, *wordend;
-	wordend = (char *)&sockbuf;
-
-	ADVANCE_IF_LAST_RET();
-		
-	Bar *bar = NULL, *it;
-	bool all = false;
-		
-	if (!strcmp(wordbeg, "all")) {
-		all = true;
-	} else if (!strcmp(wordbeg, "selected")) {
-		wl_list_for_each(it, &bar_list, link) {
-			if (it->sel) {
-				bar = it;
-				break;
-			}
-		}
-	} else {
-		wl_list_for_each(it, &bar_list, link) {
-			if (it->xdg_output_name && !strcmp(wordbeg, it->xdg_output_name)) {
-				bar = it;
-				break;
-			}
-		}
-	}
-		
-	if (!all && !bar)
-		return;
-	
-	ADVANCE();
-
-	if (!strcmp(wordbeg, "status")) {
-		if (!*wordend)
-			return;
-		if (all) {
-			Bar *first = NULL;
-			wl_list_for_each(bar, &bar_list, link) {
-				if (first) {
-					copy_customtext(&first->status, &bar->status);
-				} else {
-					parse_into_customtext(&bar->status, wordend);
-					first = bar;
-				}
-				bar->redraw = true;
-			}
-		} else {
-			parse_into_customtext(&bar->status, wordend);
-			bar->redraw = true;
-		}
-	} else if (!strcmp(wordbeg, "title")) {
-		if (!custom_title || !*wordend)
-			return;
-		if (all) {
-			Bar *first = NULL;
-			wl_list_for_each(bar, &bar_list, link) {
-				if (first) {
-					copy_customtext(&first->title, &bar->title);
-				} else {
-					parse_into_customtext(&bar->title, wordend);
-					first = bar;
-				}
-				bar->redraw = true;
-			}
-		} else {
-			parse_into_customtext(&bar->title, wordend);
-			bar->redraw = true;
-		}
-	} else if (!strcmp(wordbeg, "show")) {
-		if (all) {
-			wl_list_for_each(bar, &bar_list, link)
-				if (bar->hidden)
-					show_bar(bar);
-		} else {
-			if (bar->hidden)
-				show_bar(bar);
-		}
-	} else if (!strcmp(wordbeg, "hide")) {
-		if (all) {
-			wl_list_for_each(bar, &bar_list, link)
-				if (!bar->hidden)
-					hide_bar(bar);
-		} else {
-			if (!bar->hidden)
-				hide_bar(bar);
-		}
-	} else if (!strcmp(wordbeg, "toggle-visibility")) {
-		if (all) {
-			wl_list_for_each(bar, &bar_list, link)
-				if (bar->hidden)
-					show_bar(bar);
-				else
-					hide_bar(bar);
-		} else {
-			if (bar->hidden)
-				show_bar(bar);
-			else
-				hide_bar(bar);
-		}
-	} else if (!strcmp(wordbeg, "set-top")) {
-		if (all) {
-			wl_list_for_each(bar, &bar_list, link)
-				if (bar->bottom)
-					set_top(bar);
-						
-		} else {
-			if (bar->bottom)
-				set_top(bar);
-		}
-	} else if (!strcmp(wordbeg, "set-bottom")) {
-		if (all) {
-			wl_list_for_each(bar, &bar_list, link)
-				if (!bar->bottom)
-					set_bottom(bar);
-						
-		} else {
-			if (!bar->bottom)
-				set_bottom(bar);
-		}
-	} else if (!strcmp(wordbeg, "toggle-location")) {
-		if (all) {
-			wl_list_for_each(bar, &bar_list, link)
-				if (bar->bottom)
-					set_top(bar);
-				else
-					set_bottom(bar);
-		} else {
-			if (bar->bottom)
-				set_top(bar);
-			else
-				set_bottom(bar);
-		}
-	}
-}
+/*}}}*/
 
 static void
 event_loop(void)
 {
+	Bar *bar;
 	int wl_fd = wl_display_get_fd(display);
-
+	struct pollfd wl_p = {wl_fd, POLLIN, POLLIN};
 	while (run_display) {
-		fd_set rfds;
-		FD_ZERO(&rfds);
-		FD_SET(wl_fd, &rfds);
-		FD_SET(sock_fd, &rfds);
-		if (!ipc)
-			FD_SET(STDIN_FILENO, &rfds);
-
 		wl_display_flush(display);
-
-		if (select(MAX(sock_fd, wl_fd) + 1, &rfds, NULL, NULL, NULL) == -1) {
-			if (errno == EINTR)
-				continue;
-			else
-				EDIE("select");
-		}
-		
-		if (FD_ISSET(wl_fd, &rfds))
+		int npol = poll(&wl_p, 1, 1000);
+		if(npol > 0){
 			if (wl_display_dispatch(display) == -1)
 				break;
-		if (FD_ISSET(sock_fd, &rfds))
-			read_socket();
-		if (!ipc && FD_ISSET(STDIN_FILENO, &rfds))
-			read_stdin();
-		
-		Bar *bar;
+		}
+		int status_redraw = 0;
+		for(int i=0; i<nblocks; i++){
+			status_redraw |= blocks[i].updatefn(blocks+i);
+		}
 		wl_list_for_each(bar, &bar_list, link) {
-			if (bar->redraw) {
+			if (bar->redraw || status_redraw) {
 				if (!bar->hidden)
 					draw_frame(bar);
 				bar->redraw = false;
 			}
 		}
 	}
-}
-
-static void
-client_send_command(struct sockaddr_un *sock_address, const char *output,
-		    const char *cmd, const char *data, const char *target_socket)
-{
-	DIR *dir;
-	if (!(dir = opendir(socketdir)))
-		EDIE("Could not open directory '%s'", socketdir);
-
-	if (data)
-		snprintf(sockbuf, sizeof sockbuf, "%s %s %s", output, cmd, data);
-	else
-		snprintf(sockbuf, sizeof sockbuf, "%s %s", output, cmd);
-	
-	size_t len = strlen(sockbuf);
-			
-	struct dirent *de;
-	bool newfd = true;
-
-	/* Send data to all dwlb instances */
-	while ((de = readdir(dir))) {
-		if (!strncmp(de->d_name, "dwlb-", 5)) {
-			if (!target_socket || !strncmp(de -> d_name, target_socket, 6)){
-				if (newfd && (sock_fd = socket(AF_UNIX, SOCK_STREAM, 1)) == -1)
-					EDIE("socket");
-				snprintf(sock_address->sun_path, sizeof sock_address->sun_path, "%s/%s", socketdir, de->d_name);
-				if (connect(sock_fd, (struct sockaddr *) sock_address, sizeof(*sock_address)) == -1) {
-					newfd = false;
-					continue;
-				}
-				if (send(sock_fd, sockbuf, len, 0) == -1)
-					fprintf(stderr, "Could not send status data to '%s'\n", sock_address->sun_path);
-				close(sock_fd);
-				newfd = true;
-			}
-		}
-	}
-
-	closedir(dir);
 }
 
 void
@@ -1666,204 +1135,7 @@ sig_handler(int sig)
 int
 main(int argc, char **argv)
 {
-	char *xdgruntimedir;
-	struct sockaddr_un sock_address;
-	Bar *bar, *bar2;
-	Seat *seat, *seat2;
-
-	/* Establish socket directory */
-	if (!(xdgruntimedir = getenv("XDG_RUNTIME_DIR")))
-		DIE("Could not retrieve XDG_RUNTIME_DIR");
-	snprintf(socketdir, sizeof socketdir, "%s/dwlb", xdgruntimedir);
-	if (mkdir(socketdir, S_IRWXU) == -1)
-		if (errno != EEXIST)
-			EDIE("Could not create directory '%s'", socketdir);
-	sock_address.sun_family = AF_UNIX;
-
-	/* Parse options */
-	char *target_socket = NULL;
-	int i = 1;
-	if (argc > 1 && !strcmp(argv[1], "-target-socket")) {
-		if (2 >= argc) {
-			DIE("Option -socket requires an argument");
-		}
-		target_socket = argv[2];
-		i += 2;
-	}
-	for (; i < argc; i++) {
-		if (!strcmp(argv[i], "-status")) {
-			if (++i + 1 >= argc)
-				DIE("Option -status requires two arguments");
-			client_send_command(&sock_address, argv[i], "status", argv[i + 1], target_socket);
-			return 0;
-		} else if (!strcmp(argv[i], "-status-stdin")) {
-			if (++i >= argc)
-				DIE("Option -status-stdin requires an argument");
-			char *status = malloc(TEXT_MAX * sizeof(char));
-			while (fgets(status, TEXT_MAX-1, stdin)) {
-				status[strlen(status)-1] = '\0';
-				client_send_command(&sock_address, argv[i], "status", status, target_socket);
-			}
-			free(status);
-			return 0;
-		} else if (!strcmp(argv[i], "-title")) {
-			if (++i + 1 >= argc)
-				DIE("Option -title requires two arguments");
-			client_send_command(&sock_address, argv[i], "title", argv[i + 1], target_socket);
-			return 0;
-		} else if (!strcmp(argv[i], "-show")) {
-			if (++i >= argc)
-				DIE("Option -show requires an argument");
-			client_send_command(&sock_address, argv[i], "show", NULL, target_socket);
-			return 0;
-		} else if (!strcmp(argv[i], "-hide")) {
-			if (++i >= argc)
-				DIE("Option -hide requires an argument");
-			client_send_command(&sock_address, argv[i], "hide", NULL, target_socket);
-			return 0;
-		} else if (!strcmp(argv[i], "-toggle-visibility")) {
-			if (++i >= argc)
-				DIE("Option -toggle requires an argument");
-			client_send_command(&sock_address, argv[i], "toggle-visibility", NULL, target_socket);
-			return 0;
-		} else if (!strcmp(argv[i], "-set-top")) {
-			if (++i >= argc)
-				DIE("Option -set-top requires an argument");
-			client_send_command(&sock_address, argv[i], "set-top", NULL, target_socket);
-			return 0;
-		} else if (!strcmp(argv[i], "-set-bottom")) {
-			if (++i >= argc)
-				DIE("Option -set-bottom requires an argument");
-			client_send_command(&sock_address, argv[i], "set-bottom", NULL, target_socket);
-			return 0;
-		} else if (!strcmp(argv[i], "-toggle-location")) {
-			if (++i >= argc)
-				DIE("Option -toggle-location requires an argument");
-			client_send_command(&sock_address, argv[i], "toggle-location", NULL, target_socket);
-			return 0;
-		} else if (!strcmp(argv[i], "-ipc")) {
-			ipc = true;
-		} else if (!strcmp(argv[i], "-no-ipc")) {
-			ipc = false;
-		} else if (!strcmp(argv[i], "-hide-vacant-tags")) {
-			hide_vacant = true;
-		} else if (!strcmp(argv[i], "-no-hide-vacant-tags")) {
-			hide_vacant = false;
-		} else if (!strcmp(argv[i], "-bottom")) {
-			bottom = true;
-		} else if (!strcmp(argv[i], "-no-bottom")) {
-			bottom = false;
-		} else if (!strcmp(argv[i], "-hidden")) {
-			hidden = true;
-		} else if (!strcmp(argv[i], "-no-hidden")) {
-			hidden = false;
-		} else if (!strcmp(argv[i], "-status-commands")) {
-			status_commands = true;
-		} else if (!strcmp(argv[i], "-no-status-commands")) {
-			status_commands = false;
-		} else if (!strcmp(argv[i], "-center-title")) {
-			center_title = true;
-		} else if (!strcmp(argv[i], "-no-center-title")) {
-			center_title = false;
-		} else if (!strcmp(argv[i], "-custom-title")) {
-			custom_title = true;
-		} else if (!strcmp(argv[i], "-no-custom-title")) {
-			custom_title = false;
-		} else if (!strcmp(argv[i], "-active-color-title")) {
-			active_color_title = true;
-		} else if (!strcmp(argv[i], "-no-active-color-title")) {
-			active_color_title = false; 
-		} else if (!strcmp(argv[i], "-font")) {
-			if (++i >= argc)
-				DIE("Option -font requires an argument");
-			fontstr = argv[i];
-		} else if (!strcmp(argv[i], "-vertical-padding")) {
-			if (++i >= argc)
-				DIE("Option -vertical-padding requires an argument");
-			vertical_padding = MAX(MIN(atoi(argv[i]), 100), 0);
-		} else if (!strcmp(argv[i], "-active-fg-color")) {
-			if (++i >= argc)
-				DIE("Option -active-fg-color requires an argument");
-			if (parse_color(argv[i], &active_fg_color) == -1)
-				DIE("malformed color string");
-		} else if (!strcmp(argv[i], "-active-bg-color")) {
-			if (++i >= argc)
-				DIE("Option -active-bg-color requires an argument");
-			if (parse_color(argv[i], &active_bg_color) == -1)
-				DIE("malformed color string");
-		} else if (!strcmp(argv[i], "-occupied-fg-color")) {
-			if (++i >= argc)
-				DIE("Option -occupied-fg-color requires an argument");
-			if (parse_color(argv[i], &occupied_fg_color) == -1)
-				DIE("malformed color string");
-		} else if (!strcmp(argv[i], "-occupied-bg-color")) {
-			if (++i >= argc)
-				DIE("Option -occupied-bg-color requires an argument");
-			if (parse_color(argv[i], &occupied_bg_color) == -1)
-				DIE("malformed color string");
-		} else if (!strcmp(argv[i], "-inactive-fg-color")) {
-			if (++i >= argc)
-				DIE("Option -inactive-fg-color requires an argument");
-			if (parse_color(argv[i], &inactive_fg_color) == -1)
-				DIE("malformed color string");
-		} else if (!strcmp(argv[i], "-inactive-bg-color")) {
-			if (++i >= argc)
-				DIE("Option -inactive-bg-color requires an argument");
-			if (parse_color(argv[i], &inactive_bg_color) == -1)
-				DIE("malformed color string");
-		} else if (!strcmp(argv[i], "-urgent-fg-color")) {
-			if (++i >= argc)
-				DIE("Option -urgent-fg-color requires an argument");
-			if (parse_color(argv[i], &urgent_fg_color) == -1)
-				DIE("malformed color string");
-		} else if (!strcmp(argv[i], "-urgent-bg-color")) {
-			if (++i >= argc)
-				DIE("Option -urgent-bg-color requires an argument");
-			if (parse_color(argv[i], &urgent_bg_color) == -1)
-				DIE("malformed color string");
-		} else if (!strcmp(argv[i], "-middle-bg-color-selected")) {
-			if (++i >= argc)
-				DIE("Option -middle-bg-color-selected requires an argument");
-			if (parse_color(argv[i], &middle_bg_color_selected) == -1)
-				DIE("malformed color string");
-		} else if (!strcmp(argv[i], "-middle-bg-color")) {
-			if (++i >= argc)
-				DIE("Option -middle-bg-color requires an argument");
-			if (parse_color(argv[i], &middle_bg_color) == -1)
-				DIE("malformed color string");
-		} else if (!strcmp(argv[i], "-tags")) {
-			if (++i >= argc)
-				DIE("Option -tags requires at least one argument");
-			int v;
-			if ((v = atoi(argv[i])) < 0 || i + v >= argc)
-				DIE("-tags: invalid arguments");
-			if (tags) {
-				for (uint32_t j = 0; j < tags_l; j++)
-					free(tags[j]);
-				free(tags);
-			}
-			if (!(tags = malloc(v * sizeof(char *))))
-				EDIE("malloc");
-			for (int j = 0; j < v; j++)
-				if (!(tags[j] = strdup(argv[i + 1 + j])))
-					EDIE("strdup");
-			tags_l = tags_c = v;
-			i += v;
-		} else if (!strcmp(argv[i], "-scale")) {
-			if (++i >= argc)
-				DIE("Option -scale requires an argument");
-			buffer_scale = strtoul(argv[i], &argv[i] + strlen(argv[i]), 10);
-		} else if (!strcmp(argv[i], "-v")) {
-			fprintf(stderr, PROGRAM " " VERSION "\n");
-			return 0;
-		} else if (!strcmp(argv[i], "-h")) {
-			fprintf(stderr, USAGE);
-			return 0;
-		} else {
-			DIE("Option '%s' not recognized\n" USAGE, argv[i]);
-		}
-	}
-
+	conn = mpd_connection_new("localhost", 0, 0);
 	/* Set up display and protocols */
 	display = wl_display_connect(NULL);
 	if (!display)
@@ -1871,91 +1143,45 @@ main(int argc, char **argv)
 
 	wl_list_init(&bar_list);
 	wl_list_init(&seat_list);
-	
+
 	struct wl_registry *registry = wl_display_get_registry(display);
 	wl_registry_add_listener(registry, &registry_listener, NULL);
 	wl_display_roundtrip(display);
-	if (!compositor || !shm || !layer_shell || !output_manager || (ipc && !dwl_wm))
+	if (!compositor || !shm || !layer_shell || !output_manager || !dwl_wm)
 		DIE("Compositor does not support all needed protocols");
+
+	/* dpi setup */
+	unsigned int dpi = 96 * buffer_scale;
+	char buf[10];
+	snprintf(buf, sizeof buf, "dpi=%u", dpi);
 
 	/* Load selected font */
 	fcft_init(FCFT_LOG_COLORIZE_AUTO, 0, FCFT_LOG_CLASS_ERROR);
 	fcft_set_scaling_filter(FCFT_SCALING_FILTER_LANCZOS3);
 
-	unsigned int dpi = 96 * buffer_scale;
-	char buf[10];
-	snprintf(buf, sizeof buf, "dpi=%u", dpi);
 	if (!(font = fcft_from_name(1, (const char *[]) {fontstr}, buf)))
 		DIE("Could not load font");
 	textpadding = font->height / 2;
 	height = font->height / buffer_scale + vertical_padding * 2;
 
-	/* Configure tag names */
-	if (!ipc && !tags) {
-		if (!(tags = malloc(LENGTH(tags_names) * sizeof(char *))))
-			EDIE("malloc");
-		tags_l = tags_c = LENGTH(tags_names);
-		for (uint32_t i = 0; i < tags_l; i++)
-			if (!(tags[i] = strdup(tags_names[i])))
-				EDIE("strdup");
-	}
-	
 	/* Setup bars */
+	Bar *bar, *bar2;
+	Seat *seat, *seat2;
 	wl_list_for_each(bar, &bar_list, link)
 		setup_bar(bar);
 	wl_display_roundtrip(display);
-
-	if (!ipc) {
-		/* Configure stdin */
-		if (fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK) == -1)
-			EDIE("fcntl");
-	
-		/* Allocate stdin buffer */
-		if (!(stdinbuf = malloc(1024)))
-			EDIE("malloc");
-		stdinbuf_cap = 1024;
-	}
-
-	/* Set up socket */
-	bool found = false;
-	for (uint32_t i = 0; i < 50; i++) {
-		if ((sock_fd = socket(AF_UNIX, SOCK_STREAM, 1)) == -1)
-			DIE("socket");
-		snprintf(sock_address.sun_path, sizeof sock_address.sun_path, "%s/dwlb-%i", socketdir, i);
-		if (connect(sock_fd, (struct sockaddr *)&sock_address, sizeof sock_address) == -1) {
-			found = true;
-			break;
-		}
-		close(sock_fd);
-	}
-	if (!found)
-		DIE("Could not secure a socket path");
-
-	socketpath = (char *)&sock_address.sun_path;
-	unlink(socketpath);
-	if (bind(sock_fd, (struct sockaddr *)&sock_address, sizeof sock_address) == -1)
-		EDIE("bind");
-	if (listen(sock_fd, SOMAXCONN) == -1)
-		EDIE("listen");
-	fcntl(sock_fd, F_SETFD, FD_CLOEXEC | fcntl(sock_fd, F_GETFD));
 
 	/* Set up signals */
 	signal(SIGINT, sig_handler);
 	signal(SIGHUP, sig_handler);
 	signal(SIGTERM, sig_handler);
 	signal(SIGCHLD, SIG_IGN);
-	
+
 	/* Run */
 	run_display = true;
 	event_loop();
 
 	/* Clean everything up */
-	close(sock_fd);
-	unlink(socketpath);
-	
-	if (!ipc)
-		free(stdinbuf);
-
 	if (tags) {
 		for (uint32_t i = 0; i < tags_l; i++)
 			free(tags[i]);
@@ -1971,15 +1197,14 @@ main(int argc, char **argv)
 		teardown_bar(bar);
 	wl_list_for_each_safe(seat, seat2, &seat_list, link)
 		teardown_seat(seat);
-	
+
 	zwlr_layer_shell_v1_destroy(layer_shell);
 	zxdg_output_manager_v1_destroy(output_manager);
-	if (ipc)
-		zdwl_ipc_manager_v2_destroy(dwl_wm);
-	
+	zdwl_ipc_manager_v2_destroy(dwl_wm);
+
 	fcft_destroy(font);
 	fcft_fini();
-	
+
 	wl_shm_destroy(shm);
 	wl_compositor_destroy(compositor);
 	wl_registry_destroy(registry);
