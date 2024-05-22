@@ -74,22 +74,28 @@
 
 enum { WheelUp, WheelDown };
 
-typedef struct Block Block;
-struct Block{
+struct Blockpos{
 	uint32_t xl;
 	uint32_t xr;
+	uint32_t sel;
+	uint32_t clickid;
+};
+
+typedef struct Block Block;
+struct Block{
 	pixman_color_t fg;
 	pixman_color_t bg;
 	pixman_color_t acc;
 	char text[TEXT_MAX];
 	pixman_color_t selfg;
 	pixman_color_t selbg;
+	pixman_color_t selacc;
 	float xperc;
 	float yperc;
 	enum{LEFT, CENTER, RIGHT} gravity;
-	void (*clickfn)(Block*);
-	uint32_t clickid;
+	void (*clickfn)(Block*, struct Blockpos*);
 	int (*updatefn)(Block*);
+	uint32_t state;
 };
 
 typedef struct {
@@ -115,6 +121,7 @@ typedef struct {
 	bool redraw;
 
 	struct wl_list link;
+	struct Blockpos *bdat;
 } Bar;
 
 typedef struct {
@@ -155,6 +162,8 @@ struct mpd_connection *conn;
 int songinfo(Block*);
 int bartime(Block*);
 int battery(Block*);
+int uptime(Block*);
+void clickhide(Block*, struct Blockpos*);
 #include "config.h"
 
 static void
@@ -362,6 +371,25 @@ draw_text(char *text,
 }
 //}}}
 
+int uptime(Block* st){
+	if((st->state & 1) == 1){
+		st->xperc = 1;
+		st->yperc = 1;
+		strcpy(st->text, " ");
+		return 0;
+	}
+	FILE* f = fopen("/proc/uptime","r");
+	static float timeprev=0;
+	float timenow;
+	fscanf(f, "%f", &timenow);
+	fclose(f);
+	timenow=(timenow-timeprev)/60;
+	sprintf(st->text, "%02d:%02d", (int)(timenow/60),(int)timenow%60);
+	st->xperc = 1;
+	st->yperc = 1;
+	return 0;
+}
+
 int bartime(Block* st){
 	static time_t t=0;
 	time_t tt = time(0);
@@ -375,7 +403,18 @@ int bartime(Block* st){
 	return 1;
 }
 
+void clickhide(Block* st, struct Blockpos* dt){
+	if(dt->clickid == BTN_LEFT)
+		st->state ^= 1;
+}
+
 int songinfo(Block* st){
+	if((st->state & 1) == 1){
+		st->xperc = 1;
+		st->yperc = 1;
+		strcpy(st->text, " ");
+		return 0;
+	}
 	struct mpd_status* stat = mpd_run_status(conn);
 	/* get song name (and length) */
 	struct mpd_song* now_playing = mpd_run_current_song(conn);
@@ -512,21 +551,21 @@ draw_frame(Bar *bar)
 				x =(cx - TEXT_WIDTH(blocks[i].text,bar->width, bar->textpadding)/2);
 				break;
 		}
-		nx = zdraw_text(blocks[i].text, x, y, foreground, &blocks[i].fg, bar->width, bar->height, bar->textpadding);
+		nx = zdraw_text(blocks[i].text, x, y, foreground,  bar->bdat[i].sel ? &blocks[i].selfg : &blocks[i].fg, bar->width, bar->height, bar->textpadding);
 		pixman_image_fill_boxes(PIXMAN_OP_SRC, background,
-					&blocks[i].bg,
+					bar->bdat[i].sel ? &blocks[i].selbg : &blocks[i].bg,
 					1, &(pixman_box32_t){
 						.x1 = x, .x2 = nx,
 						.y1 = 0, .y2 = bar->height
 					});
 		pixman_image_fill_boxes(PIXMAN_OP_SRC, background,
-					&blocks[i].acc,
+					bar->bdat[i].sel ? &blocks[i].selacc : &blocks[i].acc,
 					1, &(pixman_box32_t){
 						.x1 = x, .x2 = x + (nx - x)*blocks[i].xperc,
 						.y1 = bar->height * (1 - blocks[i].yperc), .y2 = bar->height
 					});
-		blocks[i].xl = x;
-		blocks[i].xr = nx;
+		bar->bdat[i].xl = x;
+		bar->bdat[i].xr = nx;
 	}
 	/* Draw background and foreground on bar */
 	pixman_image_composite32(PIXMAN_OP_OVER, background, NULL, final, 0, 0, 0, 0, 0, 0, bar->width, bar->height);
@@ -669,6 +708,12 @@ pointer_leave(void *data, struct wl_pointer *pointer,
 	      uint32_t serial, struct wl_surface *surface)
 {
 	Seat *seat = (Seat *)data;
+	for(int i=0; i<nblocks; i++){
+		uint32_t old = seat->bar->bdat[i].sel = 1;
+		seat->bar->bdat[i].sel = 0;
+		if(old != seat->bar->bdat[i].sel)
+			seat->bar->redraw = 1;
+	}
 
 	seat->bar = NULL;
 }
@@ -697,7 +742,26 @@ pointer_frame(void *data, struct wl_pointer *pointer)
 {
 	Seat *seat = (Seat *)data;
 
-	if (!seat->pointer_button || !seat->bar)
+	if(!seat->bar) return;
+	for(int i=0; i<nblocks; i++){
+		uint32_t old = seat->bar->bdat[i].sel = 1;
+		if(seat->pointer_x >= seat->bar->bdat[i].xl && seat->pointer_x < seat->bar->bdat[i].xr){
+			seat->bar->bdat[i].sel = 1;
+			if(seat->pointer_button != 0){
+				seat->bar->bdat[i].clickid = seat->pointer_button;
+				if(blocks[i].clickfn != 0)
+					blocks[i].clickfn(blocks+i, seat->bar->bdat+i);
+				seat->bar->redraw = 1;
+			}
+		}
+		else{
+			seat->bar->bdat[i].sel = 0;
+		}
+		if(old != seat->bar->bdat[i].sel)
+			seat->bar->redraw = 1;
+	}
+
+	if (!seat->pointer_button)
 		return;
 
 	uint32_t x = 0, i = 0;
@@ -994,6 +1058,8 @@ setup_bar(Bar *bar)
 	bar->textpadding = textpadding;
 	bar->bottom = bottom;
 	bar->hidden = hidden;
+	bar->bdat = calloc(nblocks, sizeof(struct Blockpos));
+	memset(bar->bdat, 0, nblocks*sizeof(struct Blockpos));
 
 	bar->xdg_output = zxdg_output_manager_v1_get_xdg_output(output_manager, bar->wl_output);
 	if (!bar->xdg_output)
@@ -1047,6 +1113,8 @@ handle_global(void *data, struct wl_registry *registry,
 static void
 teardown_bar(Bar *bar)
 {
+	if (bar->bdat)
+		free(bar->bdat);
 	if (bar->window_title)
 		free(bar->window_title);
 	if (bar->xdg_output_name)
