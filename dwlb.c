@@ -79,6 +79,7 @@ struct Blockpos{
 	uint32_t xr;
 	uint32_t sel;
 	uint32_t clickid;
+	uint32_t scroll;
 };
 
 typedef struct Block Block;
@@ -132,6 +133,7 @@ typedef struct {
 	Bar *bar;
 	uint32_t pointer_x, pointer_y;
 	uint32_t pointer_button;
+	uint32_t scroll_dx;
 
 	struct wl_list link;
 } Seat;
@@ -159,11 +161,16 @@ static uint32_t height, textpadding, buffer_scale;
 static bool run_display;
 struct mpd_connection *conn;
 
+int wireless(Block*);
+int backlight(Block*);
 int songinfo(Block*);
 int bartime(Block*);
 int battery(Block*);
 int uptime(Block*);
+int file(Block*);
 void clickhide(Block*, struct Blockpos*);
+void cycle(Block*, struct Blockpos*);
+void scroll(Block*, struct Blockpos*);
 #include "config.h"
 
 static void
@@ -175,6 +182,209 @@ shell_command(char *command)
 		exit(EXIT_SUCCESS);
 	}
 }
+
+/* status commands:{{{*/
+
+int uptime(Block* st){
+	static float timeprev = 0.0f;
+	if((st->state & 1) == 1){
+		st->xperc = 1;
+		st->yperc = 1;
+		strcpy(st->text, "󱦟");
+		return 0;
+	}
+	float timenow;
+	FILE* f = fopen("/proc/uptime","r");
+	fscanf(f, "%f", &timenow);
+	fclose(f);
+	static int mode = 0;
+	if((st->state & 4) != 0){
+		timeprev = timenow;
+		st->state ^= 4;
+		mode = 1;
+	}
+	if((st->state & 2) != 0){
+		mode ^= 1;
+		st->state ^= 2;
+	}
+	timenow = timenow - (mode?timeprev:0.0f);
+	if(timenow<60*60){
+		sprintf(st->text, "%02d:%02d", (int)(timenow/60),(int)timenow%60);
+	}
+	else{
+		timenow /= 60;
+		sprintf(st->text, "%02d:%02d", (int)(timenow/60),(int)timenow%60);
+	}
+	st->xperc = 1;
+	st->yperc = 1;
+	return 0;
+}
+
+int bartime(Block* st){
+	static time_t t=0;
+	time_t tt = time(0);
+	if(tt == t) return 0;
+	t = tt;
+	static struct tm now;
+	localtime_r(&t, &now);
+	st->xperc = (float)now.tm_sec/60.0f;
+	st->yperc = 1;
+	sprintf(st->text, "%02d:%02d", now.tm_hour, now.tm_min);
+	return 1;
+}
+
+int wireless(Block* st){
+	st->xperc = 1.;
+	st->yperc = 1.;
+	FILE* f = fopen("/proc/net/wireless", "r");
+	fseek(f, 162+13, SEEK_SET);
+	float level = 0;
+	fscanf(f, "%f%f", &level, &level);
+	fclose(f);
+	if((st->state & 1)!= 0){
+		sprintf(st->text, level == 0 ? "󰤮" : (level > -40 ? "󰤥" : "󰤟"));
+	}
+	else{
+		sprintf(st->text, "%.0fdB", level);
+	}
+	return 0;
+}
+
+void scroll(Block* st, struct Blockpos* dt){
+	st->state = dt->scroll;
+	dt->scroll = 0;
+}
+void clickhide(Block* st, struct Blockpos* dt){
+	if(dt->clickid == BTN_LEFT)
+		st->state ^= 2;
+	if(dt->clickid == BTN_RIGHT)
+		st->state ^= 1;
+	if(dt->clickid == BTN_MIDDLE)
+		st->state ^= 4;
+}
+void cycle(Block* st, struct Blockpos* dt){
+	if(dt->clickid == BTN_RIGHT)
+		st->state += 1;
+}
+
+int backlight(Block* st){
+	FILE* f;
+	f = fopen("/sys/class/backlight/intel_backlight/brightness","r");
+	uint32_t now = 0;
+	fscanf(f, "%d", &now);
+	fclose(f);
+	if(st->state != 0){
+		f = fopen("/sys/class/backlight/intel_backlight/brightness","w");
+		if(f != 0){
+			fprintf(f, "%d", now+st->state);
+			fclose(f);
+		}
+		st->state=0;
+	}
+	f = fopen("/sys/class/backlight/intel_backlight/max_brightness","r");
+	int max = 0;
+	fscanf(f, "%d", &max);
+	fclose(f);
+	sprintf(st->text, "󱉵"); //󱉵󱈈
+	st->xperc = 1;
+	st->yperc = (float)now/(float)max;
+	return 0;
+}
+
+int songinfo(Block* st){
+	mpd_run_clearerror(conn);
+	if((st->state & 2) != 0){
+		st->state ^= 2;
+		mpd_run_toggle_pause(conn);
+	}
+	if((st->state & 4) != 0){
+		st->state ^= 4;
+		shell_command("foot ncmpcpp");
+	}
+	if((st->state & 1) == 1){
+		st->xperc = 1;
+		st->yperc = 1;
+		strcpy(st->text, "󰽲");//  
+		return 0;
+	}
+	struct mpd_status* stat = mpd_run_status(conn);
+	/* get song name (and length) */
+	struct mpd_song* now_playing = mpd_run_current_song(conn);
+	if(now_playing == 0 || stat==0){
+		strcpy(st->text, "no song active");
+		st->xperc = 1;
+		st->yperc = 1;
+		return 0;
+	}
+	const char* name = mpd_song_get_tag(now_playing, MPD_TAG_TITLE, 0);
+	//mpd_response_finish(conn);
+	const char* artist = mpd_song_get_tag(now_playing, MPD_TAG_ALBUM_ARTIST, 0);
+	if(artist == NULL)
+		artist = mpd_song_get_tag(now_playing, MPD_TAG_ARTIST, 0);
+
+	unsigned a = mpd_song_get_duration(now_playing);
+	unsigned b = mpd_status_get_elapsed_time(stat);
+	sprintf(st->text, "%s - %s", artist, name);
+	st->xperc = (float)b/(float)a;
+	st->yperc = (float)mpd_status_get_volume(stat)/100.0f;
+
+	mpd_song_free(now_playing);
+	mpd_status_free(stat);
+	return 0;
+}
+
+int battery(Block* st){
+	FILE* f;
+	f = fopen("/sys/class/power_supply/BAT1/power_now","r");
+	int pow = 0;
+	fscanf(f, "%d", &pow);
+	fclose(f);
+
+	float full = 0;
+	float now = 0;
+	f = fopen("/sys/class/power_supply/BAT1/energy_full","r");
+	fscanf(f, "%f", &full);
+	fclose(f);
+	f = fopen("/sys/class/power_supply/BAT1/energy_now","r");
+	fscanf(f, "%f", &now);
+	fclose(f);
+
+	if(st->state % 3 == 0)
+		sprintf(st->text, "%.2fW", (float)pow/1000000.0f);
+	if(st->state % 3 == 1)
+		sprintf(st->text, "");//󰁹
+	if(st->state % 3 == 2)
+		sprintf(st->text, "%.2f%%", 100*now/full);
+	st->xperc = 1.0f;
+	st->yperc = now/full;
+	return 0;
+}
+
+int file(Block* st){
+	static FILE* f;
+	if(f == 0)
+		f = fopen("/home/pyiin/bar","r");
+	if((st->state & 1) != 0){
+		char* tmp = malloc(TEXT_MAX);
+		size_t n = TEXT_MAX;
+		ssize_t b_read = getline(&tmp, &n, f);
+		if(b_read <= 0){
+			freopen("/home/pyiin/bar","r",f);
+			strcpy(st->text, "󱀺");
+		}
+		else{
+			strncpy(st->text, tmp, b_read-1);
+			st->text[b_read-1] = 0;
+		}
+		free(tmp);
+		st->state ^= 1;
+	}
+	if(st->text[0] == 0){
+		strcpy(st->text, "󱀺");
+	}
+	return 0;
+}
+/*}}}*/
 
 /* OK; BUFFER:{{{*/
 static void
@@ -371,98 +581,6 @@ draw_text(char *text,
 }
 //}}}
 
-int uptime(Block* st){
-	if((st->state & 1) == 1){
-		st->xperc = 1;
-		st->yperc = 1;
-		strcpy(st->text, " ");
-		return 0;
-	}
-	FILE* f = fopen("/proc/uptime","r");
-	static float timeprev=0;
-	float timenow;
-	fscanf(f, "%f", &timenow);
-	fclose(f);
-	timenow=(timenow-timeprev)/60;
-	sprintf(st->text, "%02d:%02d", (int)(timenow/60),(int)timenow%60);
-	st->xperc = 1;
-	st->yperc = 1;
-	return 0;
-}
-
-int bartime(Block* st){
-	static time_t t=0;
-	time_t tt = time(0);
-	if(tt == t) return 0;
-	t = tt;
-	static struct tm now;
-	localtime_r(&t, &now);
-	st->xperc = (float)now.tm_sec/60.0f;
-	st->yperc = 1;
-	sprintf(st->text, "%02d:%02d", now.tm_hour, now.tm_min);
-	return 1;
-}
-
-void clickhide(Block* st, struct Blockpos* dt){
-	if(dt->clickid == BTN_LEFT)
-		st->state ^= 1;
-}
-
-int songinfo(Block* st){
-	if((st->state & 1) == 1){
-		st->xperc = 1;
-		st->yperc = 1;
-		strcpy(st->text, " ");
-		return 0;
-	}
-	struct mpd_status* stat = mpd_run_status(conn);
-	/* get song name (and length) */
-	struct mpd_song* now_playing = mpd_run_current_song(conn);
-	if(now_playing == 0 || stat==0){
-		strcpy(st->text, "no song playing");
-		st->xperc = 1;
-		st->yperc = 1;
-		return 0;
-	}
-	const char* name = mpd_song_get_tag(now_playing, MPD_TAG_TITLE, 0);
-	const char* artist = mpd_song_get_tag(now_playing, MPD_TAG_ALBUM_ARTIST, 0);
-	if(artist == NULL)
-		artist = mpd_song_get_tag(now_playing, MPD_TAG_ARTIST, 0);
-
-	unsigned a = mpd_song_get_duration(now_playing);
-	unsigned b = mpd_status_get_elapsed_time(stat);
-	sprintf(st->text, "%s - %s", artist, name);
-	st->xperc = (float)b/(float)a;
-	st->yperc = (float)mpd_status_get_volume(stat)/100.0f;
-
-	mpd_song_free(now_playing);
-	mpd_status_free(stat);
-	return 0;
-}
-
-int battery(Block* st){
-	FILE* f;
-	f = fopen("/sys/class/power_supply/BAT1/power_now","r");
-	int pow = 0;
-	fscanf(f, "%d", &pow);
-	fclose(f);
-	sprintf(st->text, "%.2fW", (float)pow/1000000.0f);
-
-	float full = 0;
-	float now = 0;
-	f = fopen("/sys/class/power_supply/BAT1/energy_full","r");
-	fscanf(f, "%f", &full);
-	fclose(f);
-	f = fopen("/sys/class/power_supply/BAT1/energy_now","r");
-	fscanf(f, "%f", &now);
-	fclose(f);
-
-	st->xperc = 1.0f;
-	st->yperc = now/full;
-	return 0;
-}
-
-
 #define TEXT_WIDTH(text, maxwidth, padding)				\
 	draw_text(text, 0, 0, NULL, NULL, NULL, NULL, maxwidth, 0, padding)
 
@@ -499,6 +617,11 @@ draw_frame(Bar *bar)
 	uint32_t boxs = font->height / 9;
 	uint32_t boxw = font->height / 6 + 2;
 
+	pixman_image_fill_boxes(PIXMAN_OP_SRC, background,
+				&inactive_bg_color, 1, &(pixman_box32_t){
+				.x1 = 0, .x2 = bar->width,
+				.y1 = 0, .y2 = bar->height
+				});
 	for (uint32_t i = 0; i < tags_l; i++) {
 		const bool active = bar->mtags & 1 << i;
 		const bool occupied = bar->ctags & 1 << i;
@@ -714,7 +837,8 @@ pointer_leave(void *data, struct wl_pointer *pointer,
 		if(old != seat->bar->bdat[i].sel)
 			seat->bar->redraw = 1;
 	}
-
+	seat->pointer_x = -1;
+	seat->pointer_y = -1;
 	seat->bar = NULL;
 }
 
@@ -751,6 +875,12 @@ pointer_frame(void *data, struct wl_pointer *pointer)
 				seat->bar->bdat[i].clickid = seat->pointer_button;
 				if(blocks[i].clickfn != 0)
 					blocks[i].clickfn(blocks+i, seat->bar->bdat+i);
+				seat->bar->redraw = 1;
+			}
+			if(seat->scroll_dx != 0){
+				seat->bar->bdat[i].scroll = seat->scroll_dx;
+				blocks[i].clickfn(blocks+i, seat->bar->bdat+i);
+				seat->scroll_dx = 0;
 				seat->bar->redraw = 1;
 			}
 		}
@@ -798,14 +928,18 @@ static void
 pointer_axis(void *data, struct wl_pointer *pointer,
 	     uint32_t time, uint32_t axis, wl_fixed_t value)
 {
+	Seat *seat = (Seat *)data;
+	if(!seat->bar)
+		return;
+	seat->scroll_dx = wl_fixed_to_int(value);
+	//printf("%d\n", seat->scroll_dx);
 }
 
 static void
 pointer_axis_discrete(void *data, struct wl_pointer *pointer,
 		      uint32_t axis, int32_t discrete)
 {
-	uint32_t i;
-	uint32_t btn = discrete < 0 ? WheelUp : WheelDown;
+	//uint32_t btn = discrete < 0 ? WheelUp : WheelDown;
 	Seat *seat = (Seat *)data;
 
 	if (!seat->bar)
