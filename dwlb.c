@@ -96,7 +96,9 @@ struct Block{
 	enum{LEFT, CENTER, RIGHT} gravity;
 	void (*clickfn)(Block*, struct Blockpos*);
 	int (*updatefn)(Block*);
-	uint32_t state;
+	int32_t state;
+	int32_t arg;
+	uint32_t maxw;
 };
 
 typedef struct {
@@ -161,6 +163,7 @@ static uint32_t height, textpadding, buffer_scale;
 static bool run_display;
 struct mpd_connection *conn;
 
+int timer(Block*);
 int wireless(Block*);
 int backlight(Block*);
 int songinfo(Block*);
@@ -168,6 +171,7 @@ int bartime(Block*);
 int battery(Block*);
 int uptime(Block*);
 int file(Block*);
+int volume(Block*);
 void clickhide(Block*, struct Blockpos*);
 void cycle(Block*, struct Blockpos*);
 void scroll(Block*, struct Blockpos*);
@@ -185,42 +189,92 @@ shell_command(char *command)
 
 /* status commands:{{{*/
 
-int uptime(Block* st){
-	static float timeprev = 0.0f;
-	if((st->state & 1) == 1){
-		st->xperc = 1;
-		st->yperc = 1;
-		strcpy(st->text, "󱦟");
+int
+volume(Block *st){
+	static char v[100];
+	if(st->state != 0){
+		st->state /= 5;
+		if(st->state >= 0)
+			sprintf(v, "pactl set-sink-volume $(pactl get-default-sink) +%d%%", st->state);
+		else
+			sprintf(v, "pactl set-sink-volume $(pactl get-default-sink) %d%%", st->state);
+		shell_command(v);
+		st->state=0;
 		return 0;
 	}
-	float timenow;
-	FILE* f = fopen("/proc/uptime","r");
-	fscanf(f, "%f", &timenow);
-	fclose(f);
-	static int mode = 0;
-	if((st->state & 4) != 0){
-		timeprev = timenow;
-		st->state ^= 4;
-		mode = 1;
-	}
-	if((st->state & 2) != 0){
-		mode ^= 1;
-		st->state ^= 2;
-	}
-	timenow = timenow - (mode?timeprev:0.0f);
-	if(timenow<60*60){
-		sprintf(st->text, "%02d:%02d", (int)(timenow/60),(int)timenow%60);
-	}
-	else{
-		timenow /= 60;
-		sprintf(st->text, "%02d:%02d", (int)(timenow/60),(int)timenow%60);
-	}
-	st->xperc = 1;
-	st->yperc = 1;
+	int vol_prc=0;
+	//FILE* f = popen("pactl get-sink-volume $(pactl get-default-sink)","r");
+	//fscanf(f, "Volume: front-left: %d /", &vol_prc);
+	//fscanf(f, "%d", &vol_prc);
+	//pclose(f);
+	st->yperc = (float)vol_prc/100.;
 	return 0;
 }
 
-int bartime(Block* st){
+int
+timer(Block* st){
+	static int mode = 0;
+	int rettime;
+	static struct timespec base[3];
+	static struct timespec tm[3];
+	static const uint32_t cl_type[] = {CLOCK_MONOTONIC, CLOCK_BOOTTIME, CLOCK_REALTIME};
+
+	if((st->state & 1) != 0){
+		strcpy(st->text, "󱦟");
+		return 0;
+	}
+	if((st->state & 2) != 0)
+		mode++, st->state ^= 2;
+
+	clock_gettime(cl_type[mode%3], tm+mode%3);
+
+	if((st->state & 4) != 0 && tm[mode%3].tv_sec == base[mode%3].tv_sec && tm[mode%3].tv_nsec - base[mode%3].tv_nsec < 7e8)
+		memset(base + mode%3, 0, sizeof(struct timespec)), st->state ^= 4;
+	if((st->state & 4) != 0)
+		base[mode%3] = tm[mode%3], st->state ^= 4;
+	rettime = tm[mode%3].tv_sec - base[mode%3].tv_sec;
+
+	if(rettime<60*60)
+		sprintf(st->text, "%02d:%02d", (int)(rettime/60),(int)rettime%60);
+	else
+		sprintf(st->text, "%02d:%02d", (int)(rettime/3600),(int)(rettime/60)%60);
+	st->yperc = (float)(mode%3 + 1)/3.;
+	return 0;
+}
+
+int
+uptime(Block* st){
+	static enum{ICON, UPTIME, TIMER} mode = UPTIME;
+	float value;
+	static FILE *f = 0;
+	static int zerot = 0;
+	if((st->state & 1) != 0)
+		mode = (mode == ICON ? TIMER : ICON), st->state ^= 1;
+	if((st->state & 2) != 0)
+		mode = (mode == ICON ? ICON : (mode == TIMER ? UPTIME : TIMER)), st->state ^= 2;
+	if((st->state & 4) != 0)
+		zerot = time(0), mode = TIMER, st->state ^= 4;
+	switch(mode){
+case ICON:
+		strcpy(st->text, "󱦟");
+		return 0;
+case UPTIME:	f=fopen("/proc/uptime","r");
+		fscanf(f, "%f", &value);
+		fclose(f);
+		break;
+case TIMER:
+		value = time(0) - zerot;
+		break;
+	}
+	if(value<60*60)
+		sprintf(st->text, "%02d:%02d", (int)(value/60),(int)value%60);
+	else
+		sprintf(st->text, "%02d:%02d", (int)(value/3600),(int)(value/60)%60);
+	return 0;
+}
+
+int
+bartime(Block* st){
 	static time_t t=0;
 	time_t tt = time(0);
 	if(tt == t) return 0;
@@ -233,7 +287,8 @@ int bartime(Block* st){
 	return 1;
 }
 
-int wireless(Block* st){
+int
+wireless(Block* st){
 	st->xperc = 1.;
 	st->yperc = 1.;
 	FILE* f = fopen("/proc/net/wireless", "r");
@@ -242,7 +297,18 @@ int wireless(Block* st){
 	fscanf(f, "%f%f", &level, &level);
 	fclose(f);
 	if((st->state & 1)!= 0){
-		sprintf(st->text, level == 0 ? "󰤮" : (level > -40 ? "󰤥" : "󰤟"));
+		if(level == 0)
+			strcpy(st->text,"󰤮");
+		else if(level >-40)
+			strcpy(st->text,"󰤨");
+		else if(level >-50)
+			strcpy(st->text,"󰤥");
+		else if(level >-60)
+			strcpy(st->text,"󰤢");
+		else if(level >-70)
+			strcpy(st->text,"󰤟");
+		else
+			strcpy(st->text,"󰤯");
 	}
 	else{
 		sprintf(st->text, "%.0fdB", level);
@@ -250,11 +316,24 @@ int wireless(Block* st){
 	return 0;
 }
 
-void scroll(Block* st, struct Blockpos* dt){
-	st->state = dt->scroll;
-	dt->scroll = 0;
+void
+scroll(Block* st, struct Blockpos* dt){
+	if(dt->clickid == BTN_LEFT)
+		st->state ^= 2;
+	if(dt->clickid == BTN_RIGHT)
+		st->state ^= 1;
+	if(dt->clickid == BTN_MIDDLE)
+		st->state ^= 4;
+	if(dt->scroll != 0){
+		st->state ^= 8;
+		st->arg = dt->scroll;
+		dt->scroll = 0;
+	}
+	dt->clickid = 0;
 }
-void clickhide(Block* st, struct Blockpos* dt){
+
+void
+clickhide(Block* st, struct Blockpos* dt){
 	if(dt->clickid == BTN_LEFT)
 		st->state ^= 2;
 	if(dt->clickid == BTN_RIGHT)
@@ -262,24 +341,27 @@ void clickhide(Block* st, struct Blockpos* dt){
 	if(dt->clickid == BTN_MIDDLE)
 		st->state ^= 4;
 }
-void cycle(Block* st, struct Blockpos* dt){
+
+void
+cycle(Block* st, struct Blockpos* dt){
 	if(dt->clickid == BTN_RIGHT)
 		st->state += 1;
 }
 
-int backlight(Block* st){
+int
+backlight(Block* st){
 	FILE* f;
 	f = fopen("/sys/class/backlight/intel_backlight/brightness","r");
 	uint32_t now = 0;
 	fscanf(f, "%d", &now);
 	fclose(f);
-	if(st->state != 0){
+	if(st->arg != 0){
 		f = fopen("/sys/class/backlight/intel_backlight/brightness","w");
 		if(f != 0){
-			fprintf(f, "%d", now+st->state);
+			fprintf(f, "%d", now+st->arg);
 			fclose(f);
 		}
-		st->state=0;
+		st->arg=0;
 	}
 	f = fopen("/sys/class/backlight/intel_backlight/max_brightness","r");
 	int max = 0;
@@ -291,8 +373,14 @@ int backlight(Block* st){
 	return 0;
 }
 
-int songinfo(Block* st){
+int
+songinfo(Block* st){
 	mpd_run_clearerror(conn);
+	if((st->state & 8) != 0){
+		st->state ^= 8;
+		mpd_run_change_volume(conn, st->arg/5);
+		return 0;
+	}
 	if((st->state & 2) != 0){
 		st->state ^= 2;
 		mpd_run_toggle_pause(conn);
@@ -301,7 +389,7 @@ int songinfo(Block* st){
 		st->state ^= 4;
 		shell_command("foot ncmpcpp");
 	}
-	if((st->state & 1) == 1){
+	if((st->state & 1) != 0){
 		st->xperc = 1;
 		st->yperc = 1;
 		strcpy(st->text, "󰽲");//  
@@ -333,7 +421,8 @@ int songinfo(Block* st){
 	return 0;
 }
 
-int battery(Block* st){
+int
+battery(Block* st){
 	FILE* f;
 	f = fopen("/sys/class/power_supply/BAT1/power_now","r");
 	int pow = 0;
@@ -360,7 +449,8 @@ int battery(Block* st){
 	return 0;
 }
 
-int file(Block* st){
+int
+file(Block* st){
 	static FILE* f;
 	if(f == 0)
 		f = fopen("/home/pyiin/bar","r");
@@ -665,7 +755,7 @@ draw_frame(Bar *bar)
 	for(int i=0; i<nblocks; i++){
 		switch(blocks[i].gravity){
 			case RIGHT:
-				x = rx = (rx - TEXT_WIDTH(blocks[i].text,bar->width, bar->textpadding));
+				x = rx = (rx - TEXT_WIDTH(blocks[i].text, blocks[i].maxw == 0 ? bar->width : blocks[i].maxw, bar->textpadding));
 				break;
 			case LEFT:
 				x = lx;
@@ -674,7 +764,9 @@ draw_frame(Bar *bar)
 				x =(cx - TEXT_WIDTH(blocks[i].text,bar->width, bar->textpadding)/2);
 				break;
 		}
-		nx = zdraw_text(blocks[i].text, x, y, foreground,  bar->bdat[i].sel ? &blocks[i].selfg : &blocks[i].fg, bar->width, bar->height, bar->textpadding);
+		blocks[i].xperc = MAX(0., MIN(1., blocks[i].xperc));
+		blocks[i].yperc = MAX(0., MIN(1., blocks[i].yperc));
+		nx = draw_text(blocks[i].text, x, y, foreground, 0,  bar->bdat[i].sel ? &blocks[i].selfg : &blocks[i].fg, 0, blocks[i].maxw == 0 ? bar->width : blocks[i].maxw + x, bar->height, bar->textpadding);
 		pixman_image_fill_boxes(PIXMAN_OP_SRC, background,
 					bar->bdat[i].sel ? &blocks[i].selbg : &blocks[i].bg,
 					1, &(pixman_box32_t){
@@ -1364,7 +1456,7 @@ main(int argc, char **argv)
 	if (!(font = fcft_from_name(1, (const char *[]) {fontstr}, buf)))
 		DIE("Could not load font");
 	textpadding = font->height / 2;
-	height = font->height / buffer_scale + vertical_padding * 2;
+	height = font->height/ buffer_scale + vertical_padding * 2;
 
 	/* Setup bars */
 	Bar *bar, *bar2;
