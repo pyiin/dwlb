@@ -119,12 +119,14 @@ typedef struct {
 	uint32_t mtags, ctags, urg, sel;
 	char *layout, *window_title;
 	uint32_t layout_idx, last_layout_idx;
+	uint32_t cnum[32];
 
 	bool hidden, bottom;
 	bool redraw;
 
 	struct wl_list link;
 	struct Blockpos *bdat;
+	uint32_t colidx[32];
 } Bar;
 
 typedef struct {
@@ -163,13 +165,13 @@ static uint32_t height, textpadding, buffer_scale;
 static bool run_display;
 struct mpd_connection *conn;
 
+int counter(Block*);
 int timer(Block*);
 int wireless(Block*);
 int backlight(Block*);
 int songinfo(Block*);
 int bartime(Block*);
 int battery(Block*);
-int uptime(Block*);
 int file(Block*);
 int volume(Block*);
 void clickhide(Block*, struct Blockpos*);
@@ -188,7 +190,6 @@ shell_command(char *command)
 }
 
 /* status commands:{{{*/
-
 int
 volume(Block *st){
 	static char v[100];
@@ -210,80 +211,83 @@ volume(Block *st){
 	st->yperc = (float)vol_prc/100.;
 	return 0;
 }
+int
+counter(Block* st){
+	static int count = 0;
+	if((st->state & 1) != 0){
+		strcpy(st->text, "󰆙");
+		st->state &= 1;
+		return 0;
+	}
+	if((st->state & 2) != 0)
+		count++, st->state ^= 2;
+	if((st->state & 4) != 0)
+		count--, st->state ^= 4;
+	sprintf(st->text,"𞁞%d", count);
+	return 0;
+}
 
+// ₀ ₁ ₂ ₃ ₄ ₅ ₆ ₇ ₈ ₉ ₊ ₋ ₌ ₍ ₎
+// ₐ ₑ ₒ ₓ ₔ ₕ ₖ ₗ ₘ ₙ ₚ ₛ ₜ
+// 𞁑 𞁒 𞁓 𞁔 𞁕 𞁖 𞁗 𞁘 𞁙 𞁚 𞁛 𞁜 𞁝 𞁞 𞁟 𞁠 𞁡 𞁢 𞁣 𞁤 𞁥 𞁦 𞁧 𞁨 𞁩 𞁪
+// ᵢ ᵣ ᵤ ᵥ ᵦ ᵧ ᵨ ᵩ ᵪ
+#define NTIMER 4
 int
 timer(Block* st){
 	static int mode = 0;
-	int rettime;
-	static struct timespec base[3];
-	static struct timespec tm[3];
-	static const uint32_t cl_type[] = {CLOCK_MONOTONIC, CLOCK_BOOTTIME, CLOCK_REALTIME};
+	static struct timespec base[NTIMER];
+	static struct timespec tm[NTIMER];
+	static const uint32_t cl_type[] = {CLOCK_MONOTONIC, CLOCK_BOOTTIME, CLOCK_REALTIME, CLOCK_REALTIME};
+	static const char* id[] = {"₊","𞁒","₁","₂"};
 
 	if((st->state & 1) != 0){
 		strcpy(st->text, "󱦟");
+		st->state &= 1;
 		return 0;
 	}
 	if((st->state & 2) != 0)
 		mode++, st->state ^= 2;
 
-	clock_gettime(cl_type[mode%3], tm+mode%3);
+	clock_gettime(cl_type[mode%NTIMER], tm+mode%NTIMER);
 
-	if((st->state & 4) != 0 && tm[mode%3].tv_sec == base[mode%3].tv_sec && tm[mode%3].tv_nsec - base[mode%3].tv_nsec < 7e8)
-		memset(base + mode%3, 0, sizeof(struct timespec)), st->state ^= 4;
+	//reset.
+	if((st->state & 4) != 0 && tm[mode%NTIMER].tv_sec == base[mode%NTIMER].tv_sec && tm[mode%NTIMER].tv_nsec - base[mode%NTIMER].tv_nsec < 7e8)
+		memset(base + mode%NTIMER, 0, sizeof(struct timespec)), st->state ^= 4;
 	if((st->state & 4) != 0)
-		base[mode%3] = tm[mode%3], st->state ^= 4;
-	rettime = tm[mode%3].tv_sec - base[mode%3].tv_sec;
+		base[mode%NTIMER] = tm[mode%NTIMER], st->state ^= 4;
+
+	int rettime = tm[mode%NTIMER].tv_sec - base[mode%NTIMER].tv_sec;
 
 	if(rettime<60*60)
-		sprintf(st->text, "%02d:%02d", (int)(rettime/60),(int)rettime%60);
+		sprintf(st->text, "%s%02d:%02d", id[mode%NTIMER], (int)(rettime/60),(int)rettime%60);
+	else if(rettime < 60*60*24)
+		sprintf(st->text, "%s%02d:%02d", id[mode%NTIMER], (int)(rettime/3600),(int)(rettime/60)%60);
 	else
-		sprintf(st->text, "%02d:%02d", (int)(rettime/3600),(int)(rettime/60)%60);
-	st->yperc = (float)(mode%3 + 1)/3.;
-	return 0;
-}
-
-int
-uptime(Block* st){
-	static enum{ICON, UPTIME, TIMER} mode = UPTIME;
-	float value;
-	static FILE *f = 0;
-	static int zerot = 0;
-	if((st->state & 1) != 0)
-		mode = (mode == ICON ? TIMER : ICON), st->state ^= 1;
-	if((st->state & 2) != 0)
-		mode = (mode == ICON ? ICON : (mode == TIMER ? UPTIME : TIMER)), st->state ^= 2;
-	if((st->state & 4) != 0)
-		zerot = time(0), mode = TIMER, st->state ^= 4;
-	switch(mode){
-case ICON:
-		strcpy(st->text, "󱦟");
-		return 0;
-case UPTIME:	f=fopen("/proc/uptime","r");
-		fscanf(f, "%f", &value);
-		fclose(f);
-		break;
-case TIMER:
-		value = time(0) - zerot;
-		break;
-	}
-	if(value<60*60)
-		sprintf(st->text, "%02d:%02d", (int)(value/60),(int)value%60);
-	else
-		sprintf(st->text, "%02d:%02d", (int)(value/3600),(int)(value/60)%60);
+		sprintf(st->text, "%s%d:%02d:%02d", id[mode%NTIMER],(int)(rettime/3600/24), (int)(rettime/3600)%24,(int)(rettime/60)%60);
+	st->yperc = (float)(mode%NTIMER + 1)/NTIMER;
 	return 0;
 }
 
 int
 bartime(Block* st){
+	//const char *weekday[] = {"Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"};
+	const char *weekday[] = {"Вск", "Пнд", "Втр", "Срд", "Чтв", "Птн", "Сбт"};
+	const char *month[] = {"I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"};
+	//const char *month[] = {"Ⅰ", "Ⅱ", "Ⅲ", "Ⅳ", "Ⅴ", "Ⅵ", "Ⅶ", "Ⅷ", "Ⅸ", "Ⅹ", "Ⅺ", "Ⅻ"};
 	static time_t t=0;
-	time_t tt = time(0);
-	if(tt == t) return 0;
-	t = tt;
+	t = time(0);
 	static struct tm now;
 	localtime_r(&t, &now);
 	st->xperc = (float)now.tm_sec/60.0f;
 	st->yperc = 1;
-	sprintf(st->text, "%02d:%02d", now.tm_hour, now.tm_min);
+	if((st->state%2) == 0)
+		sprintf(st->text, "%02d:%02d", now.tm_hour, now.tm_min);
+	else
+		sprintf(st->text, "%s, %02d %s",
+				weekday[now.tm_wday],
+				now.tm_mday,
+				month[now.tm_mon]
+				);
 	return 1;
 }
 
@@ -353,7 +357,7 @@ backlight(Block* st){
 	FILE* f;
 	f = fopen("/sys/class/backlight/intel_backlight/brightness","r");
 	uint32_t now = 0;
-	fscanf(f, "%d", &now);
+	fscanf(f, "%u", &now);
 	fclose(f);
 	if(st->arg != 0){
 		f = fopen("/sys/class/backlight/intel_backlight/brightness","w");
@@ -364,8 +368,8 @@ backlight(Block* st){
 		st->arg=0;
 	}
 	f = fopen("/sys/class/backlight/intel_backlight/max_brightness","r");
-	int max = 0;
-	fscanf(f, "%d", &max);
+	uint32_t max = 0;
+	fscanf(f, "%u", &max);
 	fclose(f);
 	sprintf(st->text, "󱉵"); //󱉵󱈈
 	st->xperc = 1;
@@ -423,29 +427,33 @@ songinfo(Block* st){
 
 int
 battery(Block* st){
-	FILE* f;
-	f = fopen("/sys/class/power_supply/BAT1/power_now","r");
+	static uint32_t mode = 0;
+	static FILE* f = 0;
 	int pow = 0;
-	fscanf(f, "%d", &pow);
-	fclose(f);
-
 	float full = 0;
 	float now = 0;
-	f = fopen("/sys/class/power_supply/BAT1/energy_full","r");
+
+	f = fopen("/sys/class/power_supply/BAT1/power_now","r");
+	fscanf(f, "%d", &pow);
+	f = freopen("/sys/class/power_supply/BAT1/energy_full","r",f);
 	fscanf(f, "%f", &full);
-	fclose(f);
-	f = fopen("/sys/class/power_supply/BAT1/energy_now","r");
+	f = freopen("/sys/class/power_supply/BAT1/energy_now","r",f);
 	fscanf(f, "%f", &now);
 	fclose(f);
 
-	if(st->state % 3 == 0)
-		sprintf(st->text, "%.2fW", (float)pow/1000000.0f);
-	if(st->state % 3 == 1)
-		sprintf(st->text, "");//󰁹
-	if(st->state % 3 == 2)
-		sprintf(st->text, "%.2f%%", 100*now/full);
 	st->xperc = 1.0f;
 	st->yperc = now/full;
+
+	if((st->state & 1) != 0){
+		strcpy(st->text, "");//󰁹
+		return 0;
+	}
+	if((st->state & 2) != 0)
+		mode++, st->state ^= 2;
+	if(mode % 2 == 0)
+		sprintf(st->text, "%.2fW", (float)pow/1000000.0f);
+	if(mode % 2 == 1)
+		sprintf(st->text, "%.2f%%", 100*now/full);
 	return 0;
 }
 
@@ -477,7 +485,7 @@ file(Block* st){
 /*}}}*/
 
 /* OK; BUFFER:{{{*/
-static void
+	static void
 wl_buffer_release(void *data, struct wl_buffer *wl_buffer)
 {
 	/* Sent by the compositor when it's no longer using this buffer */
@@ -491,7 +499,7 @@ static const struct wl_buffer_listener wl_buffer_listener = {
 
 /* DRAW ROUTINES:{{{*/
 /* Shared memory support function adapted from [wayland-book] */
-static int
+	static int
 allocate_shm_file(size_t size)
 {
 	int fd = memfd_create("surface", MFD_CLOEXEC);
@@ -508,90 +516,17 @@ allocate_shm_file(size_t size)
 	return fd;
 }
 
-#define TEXTW(text, padding)				\
-	zdraw_text(text, 0, 0, NULL, NULL, UINT32_MAX, 0, padding)
-
-// draw text, return end of drawn text.
-static uint32_t
-zdraw_text(char *text,
-	  uint32_t x,
-	  uint32_t y,
-	  pixman_image_t *img,
-	  pixman_color_t *color,
-	  uint32_t max_x,
-	  uint32_t buf_height,
-	  uint32_t padding)
-{
-	if (!text || !*text || !max_x)
-		return x;
-	bool draw_img = img && color;
-	pixman_image_t *fill;
-	if (draw_img)
-		fill = pixman_image_create_solid_fill(color);
-
-	uint32_t ix = x, nx;
-	x += padding;
-	uint32_t codepoint, state = UTF8_ACCEPT, last_cp = 0;
-	for (char *p = text; *p; p++) {
-		/* Returns nonzero if more bytes are needed */
-		if (utf8decode(&state, &codepoint, *p)) continue;
-
-		/* Turn off subpixel rendering, which complicates things when
-		 * mixed with alpha channels */
-		const struct fcft_glyph *glyph = fcft_rasterize_char_utf32(font, codepoint, FCFT_SUBPIXEL_NONE);
-		if (!glyph) continue;
-
-		/* Adjust x position based on kerning with previous glyph */
-		long kern = 0;
-		if (last_cp)
-			fcft_kerning(font, last_cp, codepoint, &kern, NULL);
-		if ((nx = x + kern + glyph->advance.x) + padding > max_x)
-			break;
-		last_cp = codepoint;
-		x += kern;
-
-		if (draw_img) {
-			/* Detect and handle pre-rendered glyphs (e.g. emoji) */
-			if (pixman_image_get_format(glyph->pix) == PIXMAN_a8r8g8b8) {
-				/* Only the alpha channel of the mask is used, so we can
-				 * use fgfill here to blend prerendered glyphs with the
-				 * same opacity */
-				pixman_image_composite32(
-					PIXMAN_OP_OVER, glyph->pix, fill, img, 0, 0, 0, 0,
-					x + glyph->x, y - glyph->y, glyph->width, glyph->height);
-			} else {
-				/* Applying the foreground color here would mess up
-				 * component alphas for subpixel-rendered text, so we
-				 * apply it when blending. */
-				pixman_image_composite32(
-					PIXMAN_OP_OVER, fill, glyph->pix, img, 0, 0, 0, 0,
-					x + glyph->x, y - glyph->y, glyph->width, glyph->height);
-			}
-		}
-		/* increment pen position */
-		x = nx;
-	}
-	if (draw_img)
-		pixman_image_unref(fill);
-	if (!last_cp)
-		return ix;
-
-	nx = x + padding;
-	return nx;
-}
-
-// old color{{{
-static uint32_t
+	static uint32_t
 draw_text(char *text,
-	  uint32_t x,
-	  uint32_t y,
-	  pixman_image_t *foreground,
-	  pixman_image_t *background,
-	  pixman_color_t *fg_color,
-	  pixman_color_t *bg_color,
-	  uint32_t max_x,
-	  uint32_t buf_height,
-	  uint32_t padding)
+		uint32_t x,
+		uint32_t y,
+		pixman_image_t *foreground,
+		pixman_image_t *background,
+		pixman_color_t *fg_color,
+		pixman_color_t *bg_color,
+		uint32_t max_x,
+		uint32_t buf_height,
+		uint32_t padding)
 {
 	if (!text || !*text || !max_x)
 		return x;
@@ -637,15 +572,15 @@ draw_text(char *text,
 				 * use fgfill here to blend prerendered glyphs with the
 				 * same opacity */
 				pixman_image_composite32(
-					PIXMAN_OP_OVER, glyph->pix, fg_fill, foreground, 0, 0, 0, 0,
-					x + glyph->x, y - glyph->y, glyph->width, glyph->height);
+						PIXMAN_OP_OVER, glyph->pix, fg_fill, foreground, 0, 0, 0, 0,
+						x + glyph->x, y - glyph->y, glyph->width, glyph->height);
 			} else {
 				/* Applying the foreground color here would mess up
 				 * component alphas for subpixel-rendered text, so we
 				 * apply it when blending. */
 				pixman_image_composite32(
-					PIXMAN_OP_OVER, fg_fill, glyph->pix, foreground, 0, 0, 0, 0,
-					x + glyph->x, y - glyph->y, glyph->width, glyph->height);
+						PIXMAN_OP_OVER, fg_fill, glyph->pix, foreground, 0, 0, 0, 0,
+						x + glyph->x, y - glyph->y, glyph->width, glyph->height);
 			}
 		}
 		/* increment pen position */
@@ -661,24 +596,23 @@ draw_text(char *text,
 	if (draw_bg) {
 		/* Fill padding background */
 		pixman_image_fill_boxes(PIXMAN_OP_OVER, background,
-					bg_color, 1, &(pixman_box32_t){
-						.x1 = ix, .x2 = nx,
-						.y1 = 0, .y2 = buf_height
-					});
+				bg_color, 1, &(pixman_box32_t){
+				.x1 = ix, .x2 = nx,
+				.y1 = 0, .y2 = buf_height
+				});
 	}
 
 	return nx;
 }
-//}}}
 
 #define TEXT_WIDTH(text, maxwidth, padding)				\
 	draw_text(text, 0, 0, NULL, NULL, NULL, NULL, maxwidth, 0, padding)
 
-static int
+	static int
 draw_frame(Bar *bar)
 {
 	/* Allocate buffer to be attached to the surface */
-        int fd = allocate_shm_file(bar->bufsize);
+	int fd = allocate_shm_file(bar->bufsize);
 	if (fd == -1)
 		return -1;
 
@@ -708,10 +642,10 @@ draw_frame(Bar *bar)
 	uint32_t boxw = font->height / 6 + 2;
 
 	pixman_image_fill_boxes(PIXMAN_OP_SRC, background,
-				&inactive_bg_color, 1, &(pixman_box32_t){
-				.x1 = 0, .x2 = bar->width,
-				.y1 = 0, .y2 = bar->height
-				});
+			&inactive_bg_color, 1, &(pixman_box32_t){
+			.x1 = 0, .x2 = bar->width,
+			.y1 = 0, .y2 = bar->height
+			});
 	for (uint32_t i = 0; i < tags_l; i++) {
 		const bool active = bar->mtags & 1 << i;
 		const bool occupied = bar->ctags & 1 << i;
@@ -720,33 +654,29 @@ draw_frame(Bar *bar)
 		if (hide_vacant && !active && !occupied && !urgent)
 			continue;
 
-		pixman_color_t *fg_color = urgent ? &urgent_fg_color : (active ? &active_fg_color : (occupied ? &occupied_fg_color : &inactive_fg_color));
+		pixman_color_t *fg_color = urgent ? &urgent_fg_color : (active ? &active_fg[bar->colidx[i]%fglen] : (occupied ? &occupied_fg[bar->colidx[i]%fglen] : &inactive_fg[bar->colidx[i]%fglen]));
 		pixman_color_t *bg_color = urgent ? &urgent_bg_color : (active ? &active_bg_color : (occupied ? &occupied_bg_color : &inactive_bg_color));
 
-		if (!hide_vacant && occupied) {
+		if(bar->cnum[i] > 0){
 			pixman_image_fill_boxes(PIXMAN_OP_SRC, foreground,
-						fg_color, 1, &(pixman_box32_t){
-							.x1 = x + boxs, .x2 = x + boxs + boxw,
-							.y1 = boxs, .y2 = boxs + boxw
-						});
-			if ((!bar->sel || !active) && boxw >= 3) {
-				/* Make box hollow */
+					fg_color, 1, &(pixman_box32_t){
+					.x1 = x + boxs, .x2 = x + boxs + boxw,
+					.y1 = boxs, .y2 = MIN(boxs + boxw + 4*(bar->cnum[i] - 1), bar->height-boxs)
+					});
+			if((!bar->sel || !active) && boxw >= 3)
 				pixman_image_fill_boxes(PIXMAN_OP_SRC, foreground,
-							&(pixman_color_t){ 0 },
-							1, &(pixman_box32_t){
-								.x1 = x + boxs + 1, .x2 = x + boxs + boxw - 1,
-								.y1 = boxs + 1, .y2 = boxs + boxw - 1
-							});
-			}
+						&(pixman_color_t){0}, 1, &(pixman_box32_t){
+						.x1 = x + boxs+1, .x2 = x + boxs + boxw - 1,
+						.y1 = boxs+1, .y2 = MIN(boxs + boxw + 4*(bar->cnum[i] - 1), bar-> height-boxs) - 1
+						});
 		}
-
 		x = draw_text(tags[i], x, y, foreground, background, fg_color, bg_color,
-			      bar->width, bar->height, bar->textpadding);
+				bar->width, bar->height, bar->textpadding);
 	}
 
 	x = draw_text(bar->layout, x, y, foreground, background,
-		      &inactive_fg_color, &inactive_bg_color, bar->width,
-		      bar->height, bar->textpadding);
+			&inactive_fg_color, &inactive_bg_color, bar->width,
+			bar->height, bar->textpadding);
 	// from x free space
 	uint32_t nx;
 	uint32_t lx = x;
@@ -768,17 +698,17 @@ draw_frame(Bar *bar)
 		blocks[i].yperc = MAX(0., MIN(1., blocks[i].yperc));
 		nx = draw_text(blocks[i].text, x, y, foreground, 0,  bar->bdat[i].sel ? &blocks[i].selfg : &blocks[i].fg, 0, blocks[i].maxw == 0 ? bar->width : blocks[i].maxw + x, bar->height, bar->textpadding);
 		pixman_image_fill_boxes(PIXMAN_OP_SRC, background,
-					bar->bdat[i].sel ? &blocks[i].selbg : &blocks[i].bg,
-					1, &(pixman_box32_t){
-						.x1 = x, .x2 = nx,
-						.y1 = 0, .y2 = bar->height
-					});
+				bar->bdat[i].sel ? &blocks[i].selbg : &blocks[i].bg,
+				1, &(pixman_box32_t){
+				.x1 = x, .x2 = nx,
+				.y1 = 0, .y2 = bar->height
+				});
 		pixman_image_fill_boxes(PIXMAN_OP_SRC, background,
-					bar->bdat[i].sel ? &blocks[i].selacc : &blocks[i].acc,
-					1, &(pixman_box32_t){
-						.x1 = x, .x2 = x + (nx - x)*blocks[i].xperc,
-						.y1 = bar->height * (1 - blocks[i].yperc), .y2 = bar->height
-					});
+				bar->bdat[i].sel ? &blocks[i].selacc : &blocks[i].acc,
+				1, &(pixman_box32_t){
+				.x1 = x, .x2 = x + (nx - x)*blocks[i].xperc,
+				.y1 = bar->height * (1 - blocks[i].yperc), .y2 = bar->height
+				});
 		bar->bdat[i].xl = x;
 		bar->bdat[i].xr = nx;
 	}
@@ -805,9 +735,9 @@ draw_frame(Bar *bar)
 /* OK; LAYER SURFACE:{{{*/
 
 /* Layer-surface setup adapted from layer-shell example in [wlroots] */
-static void
+	static void
 layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *surface,
-			uint32_t serial, uint32_t w, uint32_t h)
+		uint32_t serial, uint32_t w, uint32_t h)
 {
 	w = w * buffer_scale;
 	h = h * buffer_scale;
@@ -828,7 +758,7 @@ layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *surface,
 	draw_frame(bar);
 }
 
-static void
+	static void
 layer_surface_closed(void *data, struct zwlr_layer_surface_v1 *surface)
 {
 }
@@ -840,7 +770,7 @@ static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 /*}}}*/
 
 /* OK; XDG_OUTPUT:{{{ */
-static void
+	static void
 output_name(void *data, struct zxdg_output_v1 *xdg_output, const char *name)
 {
 	Bar *bar = (Bar *)data;
@@ -851,26 +781,26 @@ output_name(void *data, struct zxdg_output_v1 *xdg_output, const char *name)
 		EDIE("strdup");
 }
 
-static void
+	static void
 output_logical_position(void *data, struct zxdg_output_v1 *xdg_output,
-			int32_t x, int32_t y)
+		int32_t x, int32_t y)
 {
 }
 
-static void
+	static void
 output_logical_size(void *data, struct zxdg_output_v1 *xdg_output,
-		    int32_t width, int32_t height)
+		int32_t width, int32_t height)
 {
 }
 
-static void
+	static void
 output_done(void *data, struct zxdg_output_v1 *xdg_output)
 {
 }
 
-static void
+	static void
 output_description(void *data, struct zxdg_output_v1 *xdg_output,
-		   const char *description)
+		const char *description)
 {
 }
 
@@ -884,10 +814,10 @@ static const struct zxdg_output_v1_listener output_listener = {
 /*}}}*/
 
 /* POINTER_EVENTS: {{{*/
-static void
+	static void
 pointer_enter(void *data, struct wl_pointer *pointer,
-	      uint32_t serial, struct wl_surface *surface,
-	      wl_fixed_t surface_x, wl_fixed_t surface_y)
+		uint32_t serial, struct wl_surface *surface,
+		wl_fixed_t surface_x, wl_fixed_t surface_y)
 {
 	Seat *seat = (Seat *)data;
 
@@ -914,13 +844,13 @@ pointer_enter(void *data, struct wl_pointer *pointer,
 		wl_surface_commit(cursor_surface);
 	}
 	wl_pointer_set_cursor(pointer, serial, cursor_surface,
-			      cursor_image->hotspot_x,
-			      cursor_image->hotspot_y);
+			cursor_image->hotspot_x,
+			cursor_image->hotspot_y);
 }
 
-static void
+	static void
 pointer_leave(void *data, struct wl_pointer *pointer,
-	      uint32_t serial, struct wl_surface *surface)
+		uint32_t serial, struct wl_surface *surface)
 {
 	Seat *seat = (Seat *)data;
 	for(int i=0; i<nblocks; i++){
@@ -934,18 +864,18 @@ pointer_leave(void *data, struct wl_pointer *pointer,
 	seat->bar = NULL;
 }
 
-static void
+	static void
 pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial,
-	       uint32_t time, uint32_t button, uint32_t state)
+		uint32_t time, uint32_t button, uint32_t state)
 {
 	Seat *seat = (Seat *)data;
 
 	seat->pointer_button = state == WL_POINTER_BUTTON_STATE_PRESSED ? button : 0;
 }
 
-static void
+	static void
 pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
-	       wl_fixed_t surface_x, wl_fixed_t surface_y)
+		wl_fixed_t surface_x, wl_fixed_t surface_y)
 {
 	Seat *seat = (Seat *)data;
 
@@ -953,7 +883,7 @@ pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
 	seat->pointer_y = wl_fixed_to_int(surface_y);
 }
 
-static void
+	static void
 pointer_frame(void *data, struct wl_pointer *pointer)
 {
 	Seat *seat = (Seat *)data;
@@ -1003,7 +933,8 @@ pointer_frame(void *data, struct wl_pointer *pointer)
 		if (seat->pointer_button == BTN_LEFT)
 			zdwl_ipc_output_v2_set_tags(seat->bar->dwl_wm_output, 1 << i, 1);
 		else if (seat->pointer_button == BTN_MIDDLE)
-			zdwl_ipc_output_v2_set_tags(seat->bar->dwl_wm_output, ~0, 1);
+			//zdwl_ipc_output_v2_set_tags(seat->bar->dwl_wm_output, ~0, 1);
+			seat->bar->colidx[i]++;
 		else if (seat->pointer_button == BTN_RIGHT)
 			zdwl_ipc_output_v2_set_tags(seat->bar->dwl_wm_output, seat->bar->mtags ^ (1 << i), 0);
 	} else if (seat->pointer_x < (x += TEXT_WIDTH(seat->bar->layout, seat->bar->width - x, seat->bar->textpadding))) {
@@ -1016,9 +947,9 @@ pointer_frame(void *data, struct wl_pointer *pointer)
 	seat->pointer_button = 0;
 }
 
-static void
+	static void
 pointer_axis(void *data, struct wl_pointer *pointer,
-	     uint32_t time, uint32_t axis, wl_fixed_t value)
+		uint32_t time, uint32_t axis, wl_fixed_t value)
 {
 	Seat *seat = (Seat *)data;
 	if(!seat->bar)
@@ -1027,9 +958,9 @@ pointer_axis(void *data, struct wl_pointer *pointer,
 	//printf("%d\n", seat->scroll_dx);
 }
 
-static void
+	static void
 pointer_axis_discrete(void *data, struct wl_pointer *pointer,
-		      uint32_t axis, int32_t discrete)
+		uint32_t axis, int32_t discrete)
 {
 	//uint32_t btn = discrete < 0 ? WheelUp : WheelDown;
 	Seat *seat = (Seat *)data;
@@ -1038,21 +969,21 @@ pointer_axis_discrete(void *data, struct wl_pointer *pointer,
 		return;
 }
 
-static void
+	static void
 pointer_axis_source(void *data, struct wl_pointer *pointer,
-		    uint32_t axis_source)
+		uint32_t axis_source)
 {
 }
 
-static void
+	static void
 pointer_axis_stop(void *data, struct wl_pointer *pointer,
-		  uint32_t time, uint32_t axis)
+		uint32_t time, uint32_t axis)
 {
 }
 
-static void
+	static void
 pointer_axis_value120(void *data, struct wl_pointer *pointer,
-		      uint32_t axis, int32_t discrete)
+		uint32_t axis, int32_t discrete)
 {
 }
 
@@ -1071,9 +1002,9 @@ static const struct wl_pointer_listener pointer_listener = {
 /*}}}*/
 
 /* OK; SEAT:{{{*/
-static void
+	static void
 seat_capabilities(void *data, struct wl_seat *wl_seat,
-		  uint32_t capabilities)
+		uint32_t capabilities)
 {
 	Seat *seat = (Seat *)data;
 
@@ -1087,7 +1018,7 @@ seat_capabilities(void *data, struct wl_seat *wl_seat,
 	}
 }
 
-static void
+	static void
 seat_name(void *data, struct wl_seat *wl_seat, const char *name)
 {
 }
@@ -1099,7 +1030,7 @@ static const struct wl_seat_listener seat_listener = {
 /*}}}*/
 
 /* MOSTLY OK; add num clients. DWL COMMUNICATION:{{{*/
-static void
+	static void
 show_bar(Bar *bar)
 {
 	bar->wl_surface = wl_compositor_create_surface(compositor);
@@ -1107,23 +1038,23 @@ show_bar(Bar *bar)
 		DIE("Could not create wl_surface");
 
 	bar->layer_surface = zwlr_layer_shell_v1_get_layer_surface(layer_shell, bar->wl_surface, bar->wl_output,
-								   ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM, PROGRAM);
+			ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM, PROGRAM);
 	if (!bar->layer_surface)
 		DIE("Could not create layer_surface");
 	zwlr_layer_surface_v1_add_listener(bar->layer_surface, &layer_surface_listener, bar);
 
 	zwlr_layer_surface_v1_set_size(bar->layer_surface, 0, bar->height / buffer_scale);
 	zwlr_layer_surface_v1_set_anchor(bar->layer_surface,
-					 (bar->bottom ? ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM : ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP)
-					 | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT
-					 | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+			(bar->bottom ? ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM : ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP)
+			| ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT
+			| ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
 	zwlr_layer_surface_v1_set_exclusive_zone(bar->layer_surface, bar->height / buffer_scale);
 	wl_surface_commit(bar->wl_surface);
 
 	bar->hidden = false;
 }
 
-static void
+	static void
 hide_bar(Bar *bar)
 {
 	zwlr_layer_surface_v1_destroy(bar->layer_surface);
@@ -1133,9 +1064,9 @@ hide_bar(Bar *bar)
 	bar->hidden = true;
 }
 
-static void
+	static void
 dwl_wm_tags(void *data, struct zdwl_ipc_manager_v2 *dwl_wm,
-	uint32_t amount)
+		uint32_t amount)
 {
 	if (!tags && !(tags = malloc(amount * sizeof(char *))))
 		EDIE("malloc");
@@ -1146,9 +1077,9 @@ dwl_wm_tags(void *data, struct zdwl_ipc_manager_v2 *dwl_wm,
 			EDIE("strdup");
 }
 
-static void
+	static void
 dwl_wm_layout(void *data, struct zdwl_ipc_manager_v2 *dwl_wm,
-	const char *name)
+		const char *name)
 {
 	char **ptr;
 	ARRAY_APPEND(layouts, layouts_l, layouts_c, ptr);
@@ -1161,7 +1092,7 @@ static const struct zdwl_ipc_manager_v2_listener dwl_wm_listener = {
 	.layout = dwl_wm_layout
 };
 
-static void
+	static void
 dwl_wm_output_toggle_visibility(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output)
 {
 	Bar *bar = (Bar *)data;
@@ -1172,9 +1103,9 @@ dwl_wm_output_toggle_visibility(void *data, struct zdwl_ipc_output_v2 *dwl_wm_ou
 		hide_bar(bar);
 }
 
-static void
+	static void
 dwl_wm_output_active(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output,
-	uint32_t active)
+		uint32_t active)
 {
 	Bar *bar = (Bar *)data;
 
@@ -1182,11 +1113,12 @@ dwl_wm_output_active(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output,
 		bar->sel = active;
 }
 
-static void
+	static void
 dwl_wm_output_tag(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output,
-	uint32_t tag, uint32_t state, uint32_t clients, uint32_t focused)
+		uint32_t tag, uint32_t state, uint32_t clients, uint32_t focused)
 {
 	Bar *bar = (Bar *)data;
+	bar->cnum[tag] = clients;
 
 	if (state & ZDWL_IPC_OUTPUT_V2_TAG_STATE_ACTIVE)
 		bar->mtags |= 1 << tag;
@@ -1202,9 +1134,9 @@ dwl_wm_output_tag(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output,
 		bar->urg &= ~(1 << tag);
 }
 
-static void
+	static void
 dwl_wm_output_layout(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output,
-	uint32_t layout)
+		uint32_t layout)
 {
 	Bar *bar = (Bar *)data;
 
@@ -1212,9 +1144,9 @@ dwl_wm_output_layout(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output,
 	bar->layout_idx = layout;
 }
 
-static void
+	static void
 dwl_wm_output_title(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output,
-	const char *title)
+		const char *title)
 {
 	Bar *bar = (Bar *)data;
 
@@ -1224,15 +1156,15 @@ dwl_wm_output_title(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output,
 		EDIE("strdup");
 }
 
-static void
+	static void
 dwl_wm_output_appid(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output,
-	const char *appid)
+		const char *appid)
 {
 }
 
-static void
+	static void
 dwl_wm_output_layout_symbol(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output,
-	const char *layout)
+		const char *layout)
 {
 	Bar *bar = (Bar *)data;
 
@@ -1243,22 +1175,22 @@ dwl_wm_output_layout_symbol(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output
 	bar->layout = layouts[bar->layout_idx];
 }
 
-static void
+	static void
 dwl_wm_output_frame(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output)
 {
 	Bar *bar = (Bar *)data;
 	bar->redraw = true;
 }
 
-static void
+	static void
 dwl_wm_output_fullscreen(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output,
-	uint32_t is_fullscreen)
+		uint32_t is_fullscreen)
 {
 }
 
-static void
+	static void
 dwl_wm_output_floating(void *data, struct zdwl_ipc_output_v2 *dwl_wm_output,
-	uint32_t is_floating)
+		uint32_t is_floating)
 {
 }
 
@@ -1277,7 +1209,7 @@ static const struct zdwl_ipc_output_v2_listener dwl_wm_output_listener = {
 /*}}}*/
 
 /* OK; after removal of customtext fix. SETUP + WL_REGISTRY:{{{*/
-static void
+	static void
 setup_bar(Bar *bar)
 {
 	bar->height = height * buffer_scale;
@@ -1301,9 +1233,9 @@ setup_bar(Bar *bar)
 		show_bar(bar);
 }
 
-static void
+	static void
 handle_global(void *data, struct wl_registry *registry,
-	      uint32_t name, const char *interface, uint32_t version)
+		uint32_t name, const char *interface, uint32_t version)
 {
 	if (!strcmp(interface, wl_compositor_interface.name)) {
 		compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 4);
@@ -1336,7 +1268,7 @@ handle_global(void *data, struct wl_registry *registry,
 	}
 }
 
-static void
+	static void
 teardown_bar(Bar *bar)
 {
 	if (bar->bdat)
@@ -1355,7 +1287,7 @@ teardown_bar(Bar *bar)
 	free(bar);
 }
 
-static void
+	static void
 teardown_seat(Seat *seat)
 {
 	if (seat->wl_pointer)
@@ -1364,7 +1296,7 @@ teardown_seat(Seat *seat)
 	free(seat);
 }
 
-static void
+	static void
 handle_global_remove(void *data, struct wl_registry *registry, uint32_t name)
 {
 	Bar *bar;
@@ -1392,7 +1324,7 @@ static const struct wl_registry_listener registry_listener = {
 };
 /*}}}*/
 
-static void
+	static void
 event_loop(void)
 {
 	Bar *bar;
@@ -1419,14 +1351,14 @@ event_loop(void)
 	}
 }
 
-void
+	void
 sig_handler(int sig)
 {
 	if (sig == SIGINT || sig == SIGHUP || sig == SIGTERM)
 		run_display = false;
 }
 
-int
+	int
 main(int argc, char **argv)
 {
 	conn = mpd_connection_new("localhost", 0, 0);
