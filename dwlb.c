@@ -275,7 +275,13 @@ bartime(Block* st){
 	const char *month[] = {"I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"};
 	//const char *month[] = {"Ⅰ", "Ⅱ", "Ⅲ", "Ⅳ", "Ⅴ", "Ⅵ", "Ⅶ", "Ⅷ", "Ⅸ", "Ⅹ", "Ⅺ", "Ⅻ"};
 	static time_t t=0;
-	t = time(0);
+	static uint32_t oldstate = -1;
+	time_t tt = time(0);
+	if(oldstate == st->state && t == tt){
+		return 0;
+	}
+	t = tt;
+	oldstate = st->state;
 	static struct tm now;
 	localtime_r(&t, &now);
 	st->xperc = (float)now.tm_sec/60.0f;
@@ -608,7 +614,7 @@ draw_text(char *text,
 #define TEXT_WIDTH(text, maxwidth, padding)				\
 	draw_text(text, 0, 0, NULL, NULL, NULL, NULL, maxwidth, 0, padding)
 
-	static int
+static int
 draw_frame(Bar *bar)
 {
 	/* Allocate buffer to be attached to the surface */
@@ -675,6 +681,9 @@ draw_frame(Bar *bar)
 	}
 
 	x = draw_text(bar->layout, x, y, foreground, background,
+			&inactive_fg_color, &inactive_bg_color, bar->width,
+			bar->height, bar->textpadding);
+	x = draw_text(bar->window_title, x, y, foreground, background,
 			&inactive_fg_color, &inactive_bg_color, bar->width,
 			bar->height, bar->textpadding);
 	// from x free space

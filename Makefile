@@ -2,7 +2,7 @@ BINS = dwlb
 MANS = dwlb.1
 
 PREFIX ?= /usr/local
-CFLAGS += -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -g
+CFLAGS += -Wall -Wextra -Wpedantic -Wno-unused-parameter -Wno-format-truncation -g
 
 all: $(BINS)
 
