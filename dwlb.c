@@ -439,11 +439,11 @@ battery(Block* st){
 	float full = 0;
 	float now = 0;
 
-	f = fopen("/sys/class/power_supply/BAT1/power_now","r");
+	f = fopen("/sys/class/power_supply/BAT0/power_now","r");
 	fscanf(f, "%d", &pow);
-	f = freopen("/sys/class/power_supply/BAT1/energy_full","r",f);
+	f = freopen("/sys/class/power_supply/BAT0/energy_full","r",f);
 	fscanf(f, "%f", &full);
-	f = freopen("/sys/class/power_supply/BAT1/energy_now","r",f);
+	f = freopen("/sys/class/power_supply/BAT0/energy_now","r",f);
 	fscanf(f, "%f", &now);
 	fclose(f);
 
